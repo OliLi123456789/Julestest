@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"prop-firm-platform/data-writer/config"
+	"prop-firm-platform/data-writer/dlq_kafka_producer" // Import for DLQ
 	"prop-firm-platform/data-writer/kafka_consumer"
 	"prop-firm-platform/data-writer/timestream_writer"
 	// market_data_pb "prop-firm-platform/common/gen/go/market_data" // Not directly used here, but in other packages
@@ -33,9 +34,16 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Initialize Timestream Writer
-	// The NewTimestreamBatchWriter now starts its own timedFlushLoop goroutine using rootCtx.
-	tsWriter, err := timestream_writer.NewTimestreamBatchWriter(rootCtx, cfg.Timestream)
+	// Initialize DLQ Producer
+	instanceID, _ := os.Hostname() // Or some other unique instance identifier for ProcessorID
+	dlqProd, err := dlq_kafka_producer.NewDLQProducer(cfg.DLQKafka, instanceID)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create DLQ Kafka producer: %v", err)
+	}
+	// defer dlqProd.Close() // Explicit close sequence implemented below
+
+	// Initialize Timestream Writer, passing the DLQ producer
+	tsWriter, err := timestream_writer.NewTimestreamBatchWriter(rootCtx, cfg.Timestream, dlqProd)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to create Timestream writer: %v", err)
 	}
@@ -90,8 +98,16 @@ func main() {
 				// The Kafka consumer should close marketDataChan when it shuts down.
 				// This ensures this loop terminates after processing remaining items.
 				for msg := range marketDataChan {
+					if msg.Error != nil {
+						log.Printf("ERROR: Timestream processor (draining): Received message with pre-existing error (e.g. unmarshal failed): %v for Key: %s. Sending to DLQ.", msg.Error, msg.Key)
+						if dlqErr := dlqProd.SendToDLQ(msg.OriginalKafkaMsg, msg.Error.Error()); dlqErr != nil {
+							log.Printf("CRITICAL: Timestream processor (draining): Failed to send message (Key: %s) to DLQ: %v", msg.Key, dlqErr)
+						}
+						continue
+					}
 					if err := tsWriter.AddRecord(msg); err != nil {
-						log.Printf("ERROR: Timestream processor (draining): Failed to add record: %v. Key: %s", err, msg.Key)
+						log.Printf("ERROR: Timestream processor (draining): Failed to add record: %v. Key: %s. Original message already sent to DLQ by writer if applicable.", err, msg.Key)
+						// tsWriter.AddRecord itself now handles DLQ for its specific failures.
 					}
 				}
 				log.Println("INFO: Timestream processor: Exiting after drain attempt (marketDataChan closed or drained).")
@@ -99,17 +115,30 @@ func main() {
 			case msg, ok := <-marketDataChan:
 				if !ok {
 					log.Println("INFO: Timestream processor: marketDataChan closed by producer (Kafka consumer). Exiting.")
-					// If channel closes, it implies Kafka consumer is done.
-					// Signal main shutdown if not already happening (though rootCancel in Kafka consumer init failure handles this).
-					if rootCtx.Err() == nil { // Check if not already cancelled
+					if rootCtx.Err() == nil {
 						rootCancel()
 					}
 					running = false
 					continue
 				}
+
+				// Check if message has a deserialization error from consumer stage
+				if msg.Error != nil {
+					log.Printf("ERROR: Timestream processor: Received message with deserialization error: %v for Key: %s. Sending to DLQ.", msg.Error, msg.Key)
+					if dlqErr := dlqProd.SendToDLQ(msg.OriginalKafkaMsg, msg.Error.Error()); dlqErr != nil {
+						log.Printf("CRITICAL: Timestream processor: Failed to send message (Key: %s) with deserialization error to DLQ: %v", msg.Key, dlqErr)
+					}
+					continue // Skip further processing for this message
+				}
+
+				// AddRecord in TimestreamBatchWriter now handles routing to internal buffers,
+				// batching, timed flushes, and its own DLQ logic for Timestream write failures.
 				if err := tsWriter.AddRecord(msg); err != nil {
-					log.Printf("ERROR: Timestream processor: Failed to add record: %v. Key: %s, Topic: %s", err, msg.Key, msg.Topic)
-					// TODO: Implement proper DLQ logic for records that AddRecord fails on.
+					log.Printf("ERROR: Timestream processor: tsWriter.AddRecord failed (Key: %s, Topic: %s): %v. This implies error even after writer's retries/DLQ.", msg.Key, msg.Topic, err)
+					// If AddRecord returns an error, it means the writer itself failed catastrophically
+					// or the message was invalid even before trying to buffer (though parser should catch most).
+					// The writer's flushSpecificBuffer already handles DLQ for persistent Timestream errors.
+					// So, an error here from AddRecord might be a config issue or unhandled case.
 				}
 			}
 		}
@@ -149,7 +178,10 @@ func main() {
 
 	// Perform final cleanup like closing Timestream writer AFTER its dependent goroutines are done (or signaled)
 	log.Println("INFO: Main: Closing Timestream writer (includes internal timed flusher stop and final flushes)...")
-	tsWriter.Close() // This calls its internal context cancel, waits for its timed flusher, then flushes.
+	tsWriter.Close()
+
+	log.Println("INFO: Main: Closing DLQ producer...")
+	dlqProd.Close()
 
 	log.Println("INFO: Main: DataWriter service shut down.")
 }

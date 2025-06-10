@@ -1,0 +1,116 @@
+# Dockerfile.ibgateway (Conceptual - requires IB Gateway offline installer)
+# This Dockerfile outlines the steps to containerize Interactive Brokers Gateway.
+# Actual implementation requires:
+# 1. Downloading the appropriate IB Gateway standalone installer for Linux (e.g., latest stable).
+#    (e.g., ibgateway-stable-standalone-linux-x64.sh or similar)
+# 2. Potentially, a tool like IBController for automating login and 2FA if needed.
+# 3. Configuration files for IB Gateway (e.g., jts.ini).
+
+# Choose a base image with Java and X11 virtual framebuffer (Xvfb)
+FROM ubuntu:20.04 # Or a smaller base like adoptopenjdk/openjdk11:jre-focal
+
+LABEL maintainer="platform-dev-team@example.com"
+LABEL description="Interactive Brokers Gateway Container"
+
+ARG IBG_USER="ibuser"
+ARG IBG_UID="1000"
+ARG IBG_GID="1000"
+ARG IBG_HOME="/home/${IBG_USER}"
+ARG IBG_INSTALL_PATH="${IBG_HOME}/IBGateway" # Default path often used by installers
+ARG IBG_CONFIG_PATH="${IBG_HOME}/Jts"       # Default path for jts.ini etc.
+
+ENV IBG_VERSION="stable" # Can be overridden at build time
+# ENV DEBIAN_FRONTEND=noninteractive # For non-interactive apt-get installs
+
+# Install dependencies: Java, Xvfb, socat (sometimes useful for proxying), curl, unzip etc.
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    openjdk-11-jre-headless \
+    xvfb \
+    xauth \
+    socat \
+    curl \
+    unzip \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user to run IB Gateway
+RUN groupadd --gid ${IBG_GID} ${IBG_USER} && \
+    useradd --uid ${IBG_UID} --gid ${IBG_GID} --shell /bin/bash --create-home ${IBG_USER}
+
+# --- Installer Handling ---
+# Option 1: Download installer during build (less secure if URL changes, ensure checksum)
+# ENV IBG_INSTALLER_URL="<URL_TO_IB_GATEWAY_STANDALONE_LINUX_INSTALLER_SH>"
+# RUN curl -L -o /tmp/ibgateway_installer.sh ${IBG_INSTALLER_URL} && \
+#     chmod +x /tmp/ibgateway_installer.sh && \
+#     # The installer might need to be run as the target user, or system-wide then permissions fixed
+#     # This is highly dependent on the specific installer's behavior.
+#     # Example silent install (consult IBKR installer documentation):
+#     # /tmp/ibgateway_installer.sh -q -dir ${IBG_INSTALL_PATH} || true && \
+#     # If it fails because it tries to use GUI, might need Xvfb even for install.
+#     # chown -R ${IBG_USER}:${IBG_USER} ${IBG_INSTALL_PATH} && \
+#     # rm /tmp/ibgateway_installer.sh
+
+# Option 2: ADD local installer (preferred for reproducibility)
+# Download the installer manually and place it in the same directory as this Dockerfile.
+ADD ibgateway-${IBG_VERSION}-standalone-linux-x64.sh /tmp/ibgateway_installer.sh
+# Or specific version: ADD ibgateway-10.19.5c-standalone-linux-x64.sh /tmp/ibgateway_installer.sh
+RUN chmod +x /tmp/ibgateway_installer.sh && \
+    # Run installer (example, actual flags depend on IBKR's installer)
+    # It might require user interaction or specific flags for silent install.
+    # Often, running under Xvfb helps even for "silent" Java UI installers.
+    xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
+    /tmp/ibgateway_installer.sh -q -dir ${IBG_INSTALL_PATH} || \
+    (echo "Installer might have finished with a non-zero code due to GUI detection, check install path." && test -d ${IBG_INSTALL_PATH}/jre) && \
+    chown -R ${IBG_USER}:${IBG_USER} ${IBG_HOME} && \
+    rm /tmp/ibgateway_installer.sh
+
+# --- Configuration ---
+# Copy pre-configured jts.ini and other necessary config files.
+# These should define API port, trusted IPs (127.0.0.1 for service in same pod/host),
+# settings for auto-restart, API precautions, etc.
+# Also, handle the login automation (username/password) here if using IBController.
+# This is where you'd integrate IBController if chosen for login/2FA automation.
+COPY jts.ini ${IBG_CONFIG_PATH}/jts.ini
+# COPY ibcontroller.ini /opt/IBController/IBController.ini # If using IBController
+# COPY startup.sh /opt/startup.sh # Script to start IBController and then Gateway
+RUN chown -R ${IBG_USER}:${IBG_USER} ${IBG_CONFIG_PATH}
+# Ensure jts.ini has correct settings, e.g.:
+# ApiOnly=true
+# LocalHostOnly=false (if Python service is in a different container but same pod network) or true (if same container)
+# BindAddress=<specific_IP_if_needed_or_0.0.0.0_with_firewall>
+# ReadOnlyApi=false (for trading)
+
+USER ${IBG_USER}
+WORKDIR ${IBG_INSTALL_PATH} # Or where the launch script is
+
+# Define environment variables that might be used by Gateway or startup scripts
+ENV DISPLAY=:0 # Default display for Xvfb
+
+# Example entrypoint: a script that starts Xvfb and then the Gateway.
+# This script (`run_gateway.sh`) would need to be created and copied into the image.
+# It would contain something like:
+# #!/bin/bash
+# Xvfb :0 -screen 0 1024x768x24 -ac &
+# exec ./ibgateway # Or the actual command to start gateway, e.g., from IBController's scripts
+# For simplicity, this CMD is a placeholder. A proper startup script is usually needed.
+CMD ["echo", "Please replace CMD with a proper startup script (e.g., using Xvfb and launching IB Gateway)"]
+
+# Example of what a run_gateway.sh might look like (simplified):
+# #!/bin/bash
+# # Start Xvfb in the background
+# Xvfb :0 -screen 0 1024x768x24 -ac &
+# XVFB_PID=$!
+# # Give Xvfb a moment to start
+# sleep 3
+# # Launch IB Gateway (actual command depends on your installation and if using IBController)
+# # This assumes IB Gateway's launch script is in the current directory (IBG_INSTALL_PATH)
+# # and it's named 'ibgateway' or similar.
+# # Adjust path and command as necessary.
+# ./ibgateway # Or: java -cp jts.jar:total.jar ibgateway.GWClient -local-addr=127.0.0.1 ... (example)
+# # Clean up Xvfb when gateway exits
+# kill $XVFB_PID
+# wait $XVFB_PID
+
+# Healthcheck (optional, but good for Kubernetes)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5m \
+#   CMD nc -z localhost 4001 || exit 1 # Check if API port is listening

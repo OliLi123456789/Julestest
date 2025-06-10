@@ -35,9 +35,16 @@ type TimestreamConfig struct {
 	Concurrency          int           // Number of concurrent writers to Timestream (if sharding writes)
 }
 
+type KafkaDLQConfig struct {
+	BootstrapServers string
+	Topic            string
+	// Add SASL/SSL configs if DLQ Kafka is different or needs separate auth
+}
+
 type Config struct {
 	Kafka         KafkaConsumerConfig
 	Timestream    TimestreamConfig
+	DLQKafka      KafkaDLQConfig // Added DLQ Kafka config
 	LogLevel      string
 	ShutdownTimeout time.Duration // For graceful shutdown
 }
@@ -92,12 +99,18 @@ func LoadConfig() (*Config, error) {
 	// if kafkaUserSecretName := getEnv("KAFKA_SASL_USERNAME_SECRET_NAME", ""); kafkaUserSecretName != "" {
 	// 	 sm, err := secrets.NewManager(cfg.Timestream.Region) // Assuming common secrets manager
 	// 	 if err != nil { return nil, fmt.Errorf("failed to create secrets manager for kafka creds: %w", err)}
-	// 	 cfg.Kafka.SaslUsername, err = sm.GetSecretString(kafkaUserSecretName)
+	// 	 // cfg.Kafka.SaslUsername, err = sm.GetSecretString(kafkaUserSecretName) // Example
 	// 	 if err != nil { return nil, fmt.Errorf("failed to load Kafka username from secret %s: %w", kafkaUserSecretName, err)}
 	// } // Similar for password
 
+	// DLQ Kafka Configuration
+	cfg.DLQKafka.BootstrapServers = getEnv("DLQ_KAFKA_BOOTSTRAP_SERVERS", cfg.Kafka.BootstrapServers) // Default to same brokers
+	cfg.DLQKafka.Topic = getEnv("DLQ_KAFKA_TOPIC", "marketdata.dlq")
+
+
 	log.Printf("Config Loaded: KafkaBrokers='%s', GroupID='%s', Topics='%v'", cfg.Kafka.BootstrapServers, cfg.Kafka.GroupID, cfg.Kafka.Topics)
 	log.Printf("Config Loaded: TimestreamDB='%s', Region='%s', BatchSize=%d", cfg.Timestream.DatabaseName, cfg.Timestream.Region, cfg.Timestream.WriteBatchSize)
+	log.Printf("Config Loaded: DLQ KafkaBrokers='%s', DLQ Topic='%s'", cfg.DLQKafka.BootstrapServers, cfg.DLQKafka.Topic)
 
 	return &cfg, nil
 }

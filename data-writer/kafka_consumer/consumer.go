@@ -16,12 +16,15 @@ import (
 
 // ConsumedMessage holds a deserialized message and its original Kafka topic details.
 type ConsumedMessage struct {
-	Topic     string
-	Partition int32
-	Offset    kafka.Offset
-	Key       string
-	Value     proto.Message // Deserialized Protobuf message (e.g., *market_data_pb.Trade)
-	Timestamp time.Time
+	Topic            string
+	Partition        int32
+	Offset           kafka.Offset
+	Key              string
+	Value            proto.Message  // Deserialized Protobuf message (e.g., *market_data_pb.Trade)
+	RawValue         []byte         // Raw message value for DLQ if deserialization fails
+	Timestamp        time.Time
+	OriginalKafkaMsg *kafka.Message // Added to hold the original message for DLQ purposes
+	Error            error          // Error during processing (e.g., deserialization)
 }
 
 // KafkaConsumer wraps the confluent-kafka-go consumer.
@@ -133,27 +136,43 @@ func (kc *KafkaConsumer) consumeLoop() {
 				}
 
 				if errDeserialize != nil {
-					log.Printf("ERROR: Failed to deserialize Protobuf message from topic %s: %v. Raw value length: %d. Key: %s",
-						topicName, errDeserialize, len(e.Value), string(e.Key))
-					// TODO: Send raw e.Value to a Dead Letter Queue (DLQ) for this topic/error type.
-					if !kc.cfg.EnableAutoCommit {
-						kc.commitMessage(e) // Commit even failed messages to avoid blocking if DLQ is in place
+					log.Printf("ERROR: Failed to deserialize Protobuf message from topic %s (key: %s): %v. Sending to DLQ handler.",
+						topicName, string(e.Key), errDeserialize)
+					// Send to outChan with error for main loop to handle DLQ
+					select {
+					case kc.outChan <- ConsumedMessage{
+						Topic:            topicName,
+						Partition:        e.TopicPartition.Partition,
+						Offset:           e.TopicPartition.Offset,
+						Key:              string(e.Key),
+						RawValue:         e.Value, // Send raw value for DLQ
+						Timestamp:        e.Timestamp,
+						OriginalKafkaMsg: e,
+						Error:            fmt.Errorf("ProtobufUnmarshalFailed: %w", errDeserialize),
+					}:
+					case <-kc.ctx.Done():
+						log.Println("Kafka consumer: Shutdown signaled while sending deserialization error to outChan.")
+						run = false
 					}
-					continue
+					if !kc.cfg.EnableAutoCommit { // Still commit offset if DLQing this message
+						kc.commitMessage(e)
+					}
+					continue // Move to next message
 				}
 
 				// Send successfully deserialized message to the processing channel
 				select {
 				case kc.outChan <- ConsumedMessage{
-					Topic:     topicName,
-					Partition: e.TopicPartition.Partition,
-					Offset:    e.TopicPartition.Offset,
-					Key:       string(e.Key),
-					Value:     deserializedMsg,
-					Timestamp: e.Timestamp,
+					Topic:            topicName,
+					Partition:        e.TopicPartition.Partition,
+					Offset:           e.TopicPartition.Offset,
+					Key:              string(e.Key),
+					Value:            deserializedMsg, // Successfully deserialized value
+					RawValue:         e.Value,         // Include raw value for completeness if needed later
+					Timestamp:        e.Timestamp,
+					OriginalKafkaMsg: e,
+					Error:            nil, // No error
 				}:
-					// If manual commit, this would be where you'd stage the offset for commit
-					// AFTER it's successfully written to Timestream.
 					// For now, with auto-commit or simplified manual commit, this is fine.
 				case <-kc.ctx.Done():
 					log.Println("Kafka consumer: Shutdown signaled while sending to outChan.")

@@ -14,7 +14,9 @@ import (
 	// Adjust import paths
 	market_data_pb "prop-firm-platform/common/gen/go/market_data"
 	"prop-firm-platform/data-writer/config"
-	"prop-firm-platform/data-writer/kafka_consumer" // For ConsumedMessage type
+	"prop-firm-platform/data-writer/dlq_kafka_producer" // Import for DLQ producer
+	"prop-firm-platform/data-writer/kafka_consumer"    // For ConsumedMessage type
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka" // For kafka.Message
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsgo_cfg "github.com/aws/aws-sdk-go-v2/config" // Renamed to avoid conflict with local config
@@ -24,10 +26,12 @@ import (
 
 // tableBuffer holds records for a specific Timestream table
 type tableBuffer struct {
-	records       []types.Record
-	lastFlushTime time.Time
-	tableName     string
-	databaseName  string
+	tableName        string
+	databaseName     string
+	records          []types.Record
+	originalMessages []*kafka.Message // Store pointer to original Kafka message for DLQ
+	lastFlushTime    time.Time
+	// bufferMutex is now part of TimestreamBatchWriter, managing access to these buffers if they are map[string]*tableBuffer
 }
 
 // TimestreamBatchWriter handles batching and writing records to AWS Timestream.
@@ -35,6 +39,7 @@ type tableBuffer struct {
 type TimestreamBatchWriter struct {
 	client          *timestreamwrite.Client
 	tsCfg           config.TimestreamConfig
+	dlqProducer     *dlq_kafka_producer.DLQProducer // Added DLQ producer field
 	tradeBuffer     *tableBuffer
 	quoteBuffer     *tableBuffer
 	aggregateBuffer *tableBuffer
@@ -46,7 +51,7 @@ type TimestreamBatchWriter struct {
 }
 
 // NewTimestreamBatchWriter creates a new writer.
-func NewTimestreamBatchWriter(appCtx context.Context, cfg config.TimestreamConfig) (*TimestreamBatchWriter, error) {
+func NewTimestreamBatchWriter(appCtx context.Context, cfg config.TimestreamConfig, dlqProd *dlq_kafka_producer.DLQProducer) (*TimestreamBatchWriter, error) {
 	awsSDKCfg, err := awsgo_cfg.LoadDefaultConfig(appCtx, awsgo_cfg.WithRegion(cfg.Region))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -63,23 +68,27 @@ func NewTimestreamBatchWriter(appCtx context.Context, cfg config.TimestreamConfi
 		randSource: rand.New(rand.NewSource(time.Now().UnixNano())),
 		ctx:        ctx,
 		cancel:     cancel,
+		dlqProducer: dlqProd, // Store DLQ producer
 		tradeBuffer: &tableBuffer{
-			records:       make([]types.Record, 0, cfg.WriteBatchSize),
-			lastFlushTime: time.Now(),
-			tableName:     cfg.TradeTableName,
-			databaseName:  cfg.DatabaseName,
+			records:          make([]types.Record, 0, cfg.WriteBatchSize),
+			originalMessages: make([]*kafka.Message, 0, cfg.WriteBatchSize),
+			lastFlushTime:    time.Now(),
+			tableName:        cfg.TradeTableName,
+			databaseName:     cfg.DatabaseName,
 		},
 		quoteBuffer: &tableBuffer{
-			records:       make([]types.Record, 0, cfg.WriteBatchSize),
-			lastFlushTime: time.Now(),
-			tableName:     cfg.QuoteTableName,
-			databaseName:  cfg.DatabaseName,
+			records:          make([]types.Record, 0, cfg.WriteBatchSize),
+			originalMessages: make([]*kafka.Message, 0, cfg.WriteBatchSize),
+			lastFlushTime:    time.Now(),
+			tableName:        cfg.QuoteTableName,
+			databaseName:     cfg.DatabaseName,
 		},
 		aggregateBuffer: &tableBuffer{
-			records:       make([]types.Record, 0, cfg.WriteBatchSize),
-			lastFlushTime: time.Now(),
-			tableName:     cfg.AggregateTableName,
-			databaseName:  cfg.DatabaseName,
+			records:          make([]types.Record, 0, cfg.WriteBatchSize),
+			originalMessages: make([]*kafka.Message, 0, cfg.WriteBatchSize),
+			lastFlushTime:    time.Now(),
+			tableName:        cfg.AggregateTableName,
+			databaseName:     cfg.DatabaseName,
 		},
 	}
 	writer.wg.Add(1)
@@ -96,16 +105,13 @@ func (w *TimestreamBatchWriter) AddRecord(consumedMsg kafka_consumer.ConsumedMes
 
 	var targetBuffer *tableBuffer
 	var record types.Record
-	var err error
+	var err error // Not used in this section, but good to declare
 
 	// Common dimensions
 	dimensions := []types.Dimension{
 		{Name: aws.String("ticker"), Value: aws.String(consumedMsg.Key)},
-		// Consider adding asset_class if available or derivable
 	}
 
-	// Timestream expects time in MILLISECONDS as a STRING for records.
-	// Protobuf has nanoseconds.
 	var timestampNs int64
 	var timeStr string
 
@@ -113,21 +119,18 @@ func (w *TimestreamBatchWriter) AddRecord(consumedMsg kafka_consumer.ConsumedMes
 	case *market_data_pb.Trade:
 		targetBuffer = w.tradeBuffer
 		timestampNs = m.GetTimestampNs()
-		timeStr = strconv.FormatInt(timestampNs/1e6, 10)
+		timeStr = strconv.FormatInt(timestampNs/1e6, 10) // Milliseconds for Timestream time
 
-		// Add trade-specific dimensions
-		tradeDimensions := append([]types.Dimension{}, dimensions...) // Copy common
+		tradeDimensions := append([]types.Dimension{}, dimensions...)
 		tradeDimensions = append(tradeDimensions, types.Dimension{Name: aws.String("exchange"), Value: aws.String(m.Exchange)})
 		if m.Id != "" {
 			tradeDimensions = append(tradeDimensions, types.Dimension{Name: aws.String("trade_id"), Value: aws.String(m.Id)})
 		}
-		// Example: Conditions and Tape could be dimensions if not too high cardinality, or part of measures.
-		// For simplicity, let's model Trade with multi-measure as well.
 		record = types.Record{
 			Dimensions:       tradeDimensions,
 			Time:             aws.String(timeStr),
 			TimeUnit:         types.TimeUnitMilliseconds,
-			MeasureName:      aws.String("trade_data"),
+			MeasureName:      aws.String("trade_data"), // Common measure name for multi-measure record
 			MeasureValueType: types.MeasureValueTypeMulti,
 			MeasureValues: []types.MeasureValue{
 				{Name: aws.String("price"), Value: aws.String(fmt.Sprintf("%f", m.Price)), Type: types.MeasureValueTypeDouble},
@@ -160,7 +163,7 @@ func (w *TimestreamBatchWriter) AddRecord(consumedMsg kafka_consumer.ConsumedMes
 
 	case *market_data_pb.Aggregate:
 		targetBuffer = w.aggregateBuffer
-		timestampNs = m.GetStartTimeNs() // Aggregates use StartTimeNs for their record time
+		timestampNs = m.GetStartTimeNs()
 		timeStr = strconv.FormatInt(timestampNs/1e6, 10)
 
 		aggDimensions := append([]types.Dimension{}, dimensions...)
@@ -178,7 +181,7 @@ func (w *TimestreamBatchWriter) AddRecord(consumedMsg kafka_consumer.ConsumedMes
 				{Name: aws.String("low"), Value: aws.String(fmt.Sprintf("%f", m.Low)), Type: types.MeasureValueTypeDouble},
 				{Name: aws.String("close"), Value: aws.String(fmt.Sprintf("%f", m.Close)), Type: types.MeasureValueTypeDouble},
 				{Name: aws.String("volume"), Value: aws.String(strconv.FormatInt(m.Volume, 10)), Type: types.MeasureValueTypeBigint},
-				{Name: aws.String("vwap"), Value: aws.String(fmt.Sprintf("%f", m.Vwap)), Type: types.MeasureValueTypeDouble}, // VWAP is double in proto
+				{Name: aws.String("vwap"), Value: aws.String(fmt.Sprintf("%f", m.Vwap)), Type: types.MeasureValueTypeDouble},
 				{Name: aws.String("transactions"), Value: aws.String(strconv.FormatInt(m.Transactions, 10)), Type: types.MeasureValueTypeBigint},
 			},
 		}
@@ -188,9 +191,29 @@ func (w *TimestreamBatchWriter) AddRecord(consumedMsg kafka_consumer.ConsumedMes
 	}
 
 	targetBuffer.records = append(targetBuffer.records, record)
+	targetBuffer.originalMessages = append(targetBuffer.originalMessages, consumedMsg.OriginalKafkaMsg) // Store original message
+
 	if len(targetBuffer.records) >= w.tsCfg.WriteBatchSize {
-		// Unlock before calling flush, as flush will try to lock.
-		// This is a temporary unlock; flushBuffer will manage its own locking for the write.
+		// This is a bit simplified: flushSpecificBuffer expects context.
+		// The AddRecord method should ideally not call flush directly if flush can block for long.
+		// Instead, it should signal a flusher goroutine or rely on timed flusher.
+		// For now, direct call to illustrate batch fill trigger.
+		// A channel based approach for signaling flush might be better.
+		// Or, the timed flusher is the only one calling flushSpecificBuffer.
+		// Let's assume for now that if batch is full, we flush it here.
+		// The context passed would be w.ctx (writer's internal context).
+		err = w.flushSpecificBuffer(w.ctx, targetBuffer)
+	}
+	return err
+}
+
+// flushSpecificBuffer sends records from a specific tableBuffer to Timestream.
+// This function expects the caller (AddRecord or timedFlushLoop) to handle high-level locking if needed
+// for selecting the buffer, but this function will lock for modifying the buffer itself.
+func (w *TimestreamBatchWriter) flushSpecificBuffer(ctx context.Context, buffer *tableBuffer) error {
+	w.bufferMutex.Lock() // Lock to safely access and modify the shared buffer
+	if len(buffer.records) == 0 {
+		w.bufferMutex.Unlock()
 		// This is a bit tricky; a channel-based approach per buffer might be cleaner.
 		// For now, we pass the buffer itself to flush.
 		err = w.flushSpecificBuffer(targetBuffer)
@@ -210,7 +233,11 @@ func (w *TimestreamBatchWriter) flushSpecificBuffer(buffer *tableBuffer) error {
 
 	recordsToFlush := make([]types.Record, len(buffer.records))
 	copy(recordsToFlush, buffer.records)
-	buffer.records = make([]types.Record, 0, w.tsCfg.WriteBatchSize) // Clear specific buffer
+	originalMessagesToFlush := make([]*kafka.Message, len(buffer.originalMessages))
+	copy(originalMessagesToFlush, buffer.originalMessages)
+
+	buffer.records = make([]types.Record, 0, w.tsCfg.WriteBatchSize)
+	buffer.originalMessages = make([]*kafka.Message, 0, w.tsCfg.WriteBatchSize) // Clear original messages too
 	buffer.lastFlushTime = time.Now()
 	w.bufferMutex.Unlock() // Unlock before I/O
 
