@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.env
+tests/
+# Dockerfile itself should not be copied
+Dockerfile
+# README.md or other markdown files not needed for runtime
+*.md
+# pytest.ini not needed for runtime
+pytest.ini
+# Temporary knowledge base docs from retriever tests
+temp_kb_docs/
+# Default RAG index data that might be created locally during testing
+rag_index_data/
+# Any other local virtual environments
+.venv/
+venv/
+# IDE specific folders
+.vscode/
+.idea/
+# Git files
+.git/
+.gitignore

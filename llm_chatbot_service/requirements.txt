@@ -9,3 +9,4 @@ loguru
 prometheus-fastapi-instrumentator
 pytest
 pytest-asyncio
+pip-audit

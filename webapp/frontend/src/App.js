@@ -4,11 +4,13 @@ import LoginForm from './components/LoginForm';
 import ChartDisplay from './components/ChartDisplay';
 import OrderEntryForm from './components/OrderEntryForm';
 import OrdersView from './components/OrdersView';
+import ChatPage from './components/ChatPage'; // Import ChatPage
 
 function App() {
   const [apiToken, setApiToken] = useState(localStorage.getItem('apiToken') || null);
   const [currentSymbol, setCurrentSymbol] = useState('AAPL'); // Default symbol
   const [lastSubmittedOrder, setLastSubmittedOrder] = useState(null); // To trigger OrdersView refresh
+  const [showChatView, setShowChatView] = useState(false); // State for toggling view
 
   useEffect(() => {
     // Persist token to local storage
@@ -81,29 +83,39 @@ function App() {
       <div style={headerStyle}>
         <h1>Trading Platform</h1>
         <div>
+          <button onClick={() => setShowChatView(!showChatView)} style={{ marginRight: '10px', padding: '8px 12px', cursor: 'pointer' }}>
+            {showChatView ? 'Trading View' : 'AI Chat View'}
+          </button>
           <span>Logged in as: (testuser) </span> {/* Placeholder user display */}
-          <button onClick={handleLogout}>Logout</button>
+          <button onClick={handleLogout} style={{ padding: '8px 12px', cursor: 'pointer' }}>Logout</button>
         </div>
       </div>
 
-      <p>Selected Symbol for Chart:
-        <input
-          type="text"
-          value={currentSymbol}
-          onChange={(e) => setCurrentSymbol(e.target.value.toUpperCase())}
-          placeholder="Enter Symbol (e.g. GOOG)"
-        />
-      </p>
-
-      <div style={tradingSectionStyle}>
-        <div style={mainPanelStyle}>
-          <ChartDisplay symbol={currentSymbol} />
-          <OrderEntryForm apiToken={apiToken} onOrderSubmit={handleOrderSubmitted} />
-        </div>
-        <div style={sidePanelStyle}>
-          <OrdersView apiToken={apiToken} newSubmittedOrder={lastSubmittedOrder} />
-        </div>
-      </div>
+      {showChatView ? (
+        <ChatPage />
+      ) : (
+        <>
+          {/* Existing Trading Platform UI */}
+          <p>Selected Symbol for Chart:
+            <input
+              type="text"
+              value={currentSymbol}
+              onChange={(e) => setCurrentSymbol(e.target.value.toUpperCase())}
+              placeholder="Enter Symbol (e.g. GOOG)"
+              style={{ marginLeft: '10px', padding: '5px' }}
+            />
+          </p>
+          <div style={tradingSectionStyle}>
+            <div style={mainPanelStyle}>
+              <ChartDisplay symbol={currentSymbol} />
+              <OrderEntryForm apiToken={apiToken} onOrderSubmit={handleOrderSubmitted} />
+            </div>
+            <div style={sidePanelStyle}>
+              <OrdersView apiToken={apiToken} newSubmittedOrder={lastSubmittedOrder} />
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
