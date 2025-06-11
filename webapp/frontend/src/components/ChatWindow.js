@@ -3,6 +3,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import notificationService from '../services/notificationService'; // Assuming this exists
 import NewsDisplay from './tool_displays/NewsDisplay';
 import EarningsDisplay from './tool_displays/EarningsDisplay';
+import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { darcula } from 'react-syntax-highlighter/dist/esm/styles/prism'; // Or any other theme like okaidia, tomorrow, etc.
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
+import copy from 'copy-to-clipboard'; // For the copy-to-clipboard functionality
 
 // Basic styling (can be moved to a CSS file)
 const chatWindowStyle = { border: '1px solid #ccc', padding: '10px', height: '500px', display: 'flex', flexDirection: 'column', marginTop: '20px' };
@@ -31,6 +35,9 @@ const codeBlockStyle = {
     whiteSpace: 'pre', // Keep pre formatting for code
     fontFamily: 'monospace'
 };
+
+// Register Python language for SyntaxHighlighter (do this once)
+SyntaxHighlighter.registerLanguage('python', python);
 
 
 function ChatWindow({ apiToken, initialSessionId, currentUsername }) { // Pass apiToken, initialSessionId, and currentUsername
@@ -198,6 +205,31 @@ function ChatWindow({ apiToken, initialSessionId, currentUsername }) { // Pass a
 
     // renderMessageContent is removed, logic moved into the map function directly for clarity here.
 
+    const handleCopyCode = (codeToCopy) => {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(codeToCopy)
+                    .then(() => notificationService.showSuccess("Code copied to clipboard!"))
+                    .catch(err => {
+                        console.error("Failed to copy code using navigator.clipboard:", err);
+                        // Fallback to library if navigator.clipboard fails (e.g. http context)
+                        if (copy(codeToCopy)) {
+                            notificationService.showSuccess("Code copied to clipboard! (fallback)");
+                        } else {
+                            notificationService.showError("Failed to copy code.");
+                        }
+                    });
+            } else if (copy(codeToCopy)) { // Fallback for older browsers or insecure contexts
+                notificationService.showSuccess("Code copied to clipboard!");
+            } else {
+                notificationService.showError("Failed to copy code. Please copy manually.");
+            }
+        } catch (error) {
+            console.error("Error copying code:", error);
+            notificationService.showError("Failed to copy code due to an error.");
+        }
+    };
+
     const handleFeedback = async (messageId, botMessageText, userQuery, rating) => {
         if (feedbackSent[messageId]) {
             notificationService.showInfo("Feedback already submitted for this message.");
@@ -247,28 +279,52 @@ function ChatWindow({ apiToken, initialSessionId, currentUsername }) { // Pass a
                 </button>
             </div>
             <div style={messagesAreaStyle} className="messages-area">
-                {messages.map((msg, index) => { // Added index for finding previous message
-                    let content = <p>{msg.text}</p>; // Default for text messages
+                {messages.map((msg, index) => {
+                    let messagePrimaryContent;
 
-                    if (msg.type === 'code' && msg.raw_response?.generated_code) {
-                        // msg.text might be a preamble like "Here's the code:"
-                        // msg.raw_response.generated_code has the actual code.
-                        content = (
+                    if (msg.sender === 'bot' && msg.type === 'code' && msg.raw_response?.generated_code) {
+                        const codeString = msg.raw_response.generated_code;
+                        const preambleText = msg.text; // This is data.response_text from backend (e.g., "Here's the code:")
+                        messagePrimaryContent = (
                             <>
-                                {msg.text && <p>{msg.text}</p>}
-                                <pre style={codeBlockStyle}><code>{msg.raw_response.generated_code}</code></pre>
+                                {preambleText && preambleText !== codeString && <p>{preambleText}</p>}
+                                <div style={{ position: 'relative', backgroundColor: '#282c34', borderRadius: '5px', marginTop: '5px', marginBottom: '5px' }}>
+                                    <button
+                                        onClick={() => handleCopyCode(codeString)}
+                                        style={{
+                                            position: 'absolute', top: '8px', right: '8px', zIndex: 1,
+                                            padding: '4px 8px', cursor: 'pointer', backgroundColor: '#555',
+                                            color: 'white', border: 'none', borderRadius: '3px', fontSize: '0.8em'
+                                        }}
+                                        title="Copy code"
+                                    >
+                                        Copy
+                                    </button>
+                                    <SyntaxHighlighter
+                                        language="python"
+                                        style={darcula}
+                                        customStyle={{ margin: '0', paddingTop: '30px', paddingBottom: '10px', borderRadius: '5px', overflowX: 'auto' }}
+                                        wrapLongLines={true}
+                                    >
+                                        {codeString || ""}
+                                    </SyntaxHighlighter>
+                                </div>
+                                <p style={{fontSize: '0.8em', fontStyle: 'italic', marginTop: '5px', color: '#777'}}>
+                                    Note: Generated code is for assistance and requires thorough review and testing. Use at your own risk.
+                                </p>
                             </>
                         );
-                    } else if (msg.type === 'error') { // Explicit error type styling
-                        content = <p>{msg.text}</p>; // Style applied via messageStyle
+                    } else if (msg.type === 'error') { // Handles bot error messages
+                        messagePrimaryContent = <p>{msg.text}</p>; // Style applied via messageStyle
+                    } else { // Default for user messages and non-code/non-error bot messages
+                        messagePrimaryContent = <p>{msg.text}</p>;
                     }
-
 
                     return (
                         <div key={msg.id} style={messageStyle(msg.sender === 'user', msg.type)} className={`message ${msg.sender} message-type-${msg.type}`}>
-                            {content}
-                            {/* Render structured tool data if available, in addition to msg.text (summary) */}
-                            {msg.sender === 'bot' && msg.type !== 'error' && msg.raw_response?.structured_tool_data && (
+                            {messagePrimaryContent}
+                            {/* Render structured tool data if available (and not code and not error) */}
+                            {msg.sender === 'bot' && msg.type !== 'error' && msg.type !== 'code' && msg.raw_response?.structured_tool_data && (
                                 <div className="structured-tool-data" style={{marginTop: '10px'}}>
                                     {msg.raw_response.tool_data_type === 'news_articles' &&
                                         <NewsDisplay articles={msg.raw_response.structured_tool_data} />}
@@ -277,22 +333,25 @@ function ChatWindow({ apiToken, initialSessionId, currentUsername }) { // Pass a
                                     {/* Add more conditions for other tool_data_types here as needed */}
                                 </div>
                             )}
-                            {/* Feedback Buttons for bot messages (non-error) */}
+                            {/* Feedback Buttons for bot messages (non-error and not if message IS code itself) */}
                             {msg.sender === 'bot' && msg.type !== 'error' && (
                                 <div className="feedback-buttons" style={{ marginTop: '8px', textAlign: 'right' }}>
                                     {!feedbackSent[msg.id] ? (
                                         <>
                                             <button
                                                 onClick={() => {
-                                                    const prevUserMsg = messages[index-1]?.sender === 'user' ? messages[index-1].text : "Unknown";
-                                                    handleFeedback(msg.id, msg.text, prevUserMsg, 1);
+                                                    // Use msg.raw_response.response_text if available for more complete context, else msg.text
+                                                    const botTextForFeedback = msg.raw_response?.response_text || msg.text;
+                                                    const prevUserMsgText = messages[index-1]?.sender === 'user' ? messages[index-1].text : "Unknown";
+                                                    handleFeedback(msg.id, botTextForFeedback, prevUserMsgText, 1);
                                                 }}
                                                 title="Helpful"
                                                 style={{background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2em'}}>👍</button>
                                             <button
                                                 onClick={() => {
-                                                    const prevUserMsg = messages[index-1]?.sender === 'user' ? messages[index-1].text : "Unknown";
-                                                    handleFeedback(msg.id, msg.text, prevUserMsg, -1);
+                                                    const botTextForFeedback = msg.raw_response?.response_text || msg.text;
+                                                    const prevUserMsgText = messages[index-1]?.sender === 'user' ? messages[index-1].text : "Unknown";
+                                                    handleFeedback(msg.id, botTextForFeedback, prevUserMsgText, -1);
                                                 }}
                                                 title="Not Helpful"
                                                 style={{background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2em', marginLeft: '8px'}}>👎</button>
