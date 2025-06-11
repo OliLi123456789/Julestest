@@ -36,23 +36,21 @@ const ChatPage = () => {
 
       // Extract response text, and potentially other fields if needed later
       const botResponseText = backendResponse.response_text || "Sorry, I didn't get a proper response.";
-      // For example, if you want to display tool usage or generated code:
-      // const toolUsed = backendResponse.tool_used;
-      // const generatedCode = backendResponse.generated_code;
-      // let displayText = botResponseText;
-      // if (toolUsed) displayText += ` (Tool Used: ${toolUsed})`;
-      // if (generatedCode) displayText += `\nCode:\n${generatedCode}`;
+      const generatedCode = backendResponse.generated_code; // Get the generated code
 
       const newBotMessageId = `bot-${Date.now().toString(36)}-${Math.random().toString(36).substring(2)}`;
       const newBotMessage = {
         id: newBotMessageId,
-        text: botResponseText, // Use potentially augmented displayText here if needed
+        text: botResponseText,
         sender: 'bot',
-        // Store other useful fields from backendResponse if MessageItem is adapted to show them
-        // toolUsed: backendResponse.tool_used,
+        // toolUsed: backendResponse.tool_used, // Example if you want to store these
         // toolResponse: backendResponse.tool_response,
-        // generatedCode: backendResponse.generated_code,
       };
+
+      if (generatedCode) {
+        newBotMessage.code = generatedCode; // Add the 'code' property if it exists
+      }
+
       setMessages(prevMessages => [...prevMessages, newBotMessage]);
 
     } catch (apiError) {
