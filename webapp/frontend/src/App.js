@@ -5,6 +5,7 @@ import ChartDisplay from './components/ChartDisplay';
 import OrderEntryForm from './components/OrderEntryForm';
 import OrdersView from './components/OrdersView';
 import ChatWindow from './components/ChatWindow'; // Import ChatWindow
+import ErrorBoundary from './components/ErrorBoundary'; // Import ErrorBoundary
 import { websocketService } from './services/websocketService';
 import { notificationService } from './services/notificationService'; // Import notificationService
 
@@ -180,11 +181,13 @@ function App() {
       {/* LLM Chat Section */}
       <div className="llm-chat-section" style={{ marginTop: '30px', borderTop: '2px solid #eee', paddingTop: '20px'}}>
         <h2>AI Chat Assistant</h2>
-        <ChatWindow
-          apiToken={LLM_SERVICE_API_KEY_PLACEHOLDER} // This is the API key FOR THE LLM SERVICE
-          initialSessionId={`user_testuser_chat_${Date.now()}`} // Example session ID
-          currentUsername={"testuser_chat"} // Placeholder username
-        />
+        <ErrorBoundary>
+          <ChatWindow
+            apiToken={LLM_SERVICE_API_KEY_PLACEHOLDER} // This is the API key FOR THE LLM SERVICE
+            initialSessionId={`user_testuser_chat_${Date.now()}`} // Example session ID
+            currentUsername={"testuser_chat"} // Placeholder username
+          />
+        </ErrorBoundary>
       </div>
     </div>
   );

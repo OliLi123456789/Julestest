@@ -15,6 +15,8 @@ from .auth_llm import verify_api_key
 from .history_manager import history_manager_instance
 # Import RAG Retriever
 from .rag.retriever import Retriever, FAISS_ST_AVAILABLE_RETR
+# Import Prompts
+from .prompts import GENERAL_CHAT_SYSTEM_PROMPT
 # Import shared logging setup
 from .logging_llm import setup_llm_service_logging, LLM_SERVICE_ROOT_LOGGER_NAME
 
@@ -80,6 +82,16 @@ class LLMResponse(BaseModel):
     generated_code: Optional[str] = None
     error_message: Optional[str] = None
     rag_context_used: Optional[bool] = False
+
+class ChatMessageFeedback(BaseModel):
+    session_id: str
+    message_id: str # Could be timestamp of bot message, or a unique ID if messages have them
+    user_id: str # The user who is providing the feedback
+    rating: int # e.g., 1 for up, -1 for down
+    comment: Optional[str] = None
+    # Add other context if useful, like the bot_message_text itself
+    bot_message_text_snippet: Optional[str] = None
+    user_query_that_led_to_this_response: Optional[str] = None
 
 # --- SDK Snippet ---
 PYTHON_SDK_SNIPPET_FOR_LLM = '''
@@ -180,76 +192,111 @@ async def get_live_llm_response(
         "rag_used": rag_context is not None
     })
 
-    llm_contents_for_request: List[Any] = []
-
-    if is_code_generation_request:
-        final_prompt_string = f'''
-# You are an expert Python programmer specializing in writing algorithmic trading strategies
-# for the 'Trading Platform'. Your primary goal is to generate a complete, runnable Python
-# strategy script based on the user's request.
-
-# User's Strategy Request: "{code_gen_prompt_details}"
-
-# IMPORTANT INSTRUCTIONS AND GUIDELINES:
-# 1.  **SDK Usage:** The generated Python code MUST strictly use the 'Trading Platform Python SDK' functions and classes as defined in the SDK Reference below. Do NOT use any other hypothetical or external trading libraries (e.g., `ibapi`, `ccxt`, `alpaca_trade_api`) unless they are part of a standard Python library import like `math` or `datetime`.
-# 2.  **Strategy Structure:** The main strategy logic MUST be encapsulated within a class that inherits from `sdk.BaseStrategy`.
-# 3.  **Core Methods:** Implement the necessary `sdk.BaseStrategy` lifecycle methods: `__init__`, `on_start`, `on_bar`, `on_fill`, and `on_stop`.
-# 4.  **Imports:** Always include `import sdk` at the top of the script. Import `datetime`, `typing.Dict`, `typing.Any`, `typing.List`, `typing.Optional` as needed for type hints in method signatures.
-# 5.  **Parameters:** Strategy parameters should be accessed from `self.strategy_params` within `__init__` (e.g., `self.my_param = self.strategy_params.get('my_config_param_name', default_value)`).
-# 6.  **Market Data in `on_bar`:** Use the `current_bar_data_bundle` argument provided to `on_bar` for current bar data. Only use `sdk.get_market_data()` in `on_start()` for fetching initial historical data for indicator warm-up if necessary.
-# 7.  **Order Quantity:** For `sdk.submit_order()`, `quantity` is positive for BUY orders and negative for SELL orders.
-# 8.  **Code Only:** Your response should be ONLY the raw Python code for the strategy. Do NOT include any surrounding text, explanations, markdown formatting (like \`\`\`python ... \`\`\`), or any conversational pleasantries.
-# 9.  **Completeness:** Generate a complete, runnable script. This includes the class definition and any necessary helper functions if they are simple and self-contained.
-# 10. **Clarity:** Comment the code clearly to explain the logic.
-# 11. **Error Handling:** For SDK calls like `sdk.get_position()`, check for `None` returns before accessing attributes.
-
-# {PYTHON_SDK_SNIPPET_FOR_LLM}
-
-# Generated Python Code:
-# '''
-        llm_contents_for_request = [{'role': 'user', 'parts': [{'text': final_prompt_string}]}] # Gemini expects content format
-        logger.debug("LLM Code Gen Prompt (summary)", extra={"user_request": code_gen_prompt_details})
-    else:
-        if conversation_history:
-            llm_contents_for_request.extend(conversation_history)
-        current_user_message_content = user_message
-        if rag_context:
-            current_user_message_content = f"{rag_context}\n\nUser Question: {user_message}"
-            logger.debug("Augmented user message with RAG context.", extra={"rag_context_snippet": rag_context[:100]})
-        llm_contents_for_request.append({'role': 'user', 'parts': [{'text': current_user_message_content}]})
-        logger.debug(f"LLM Chat Content. History turns: {len(conversation_history) if conversation_history else 0}. Current message starts: '{user_message[:100]}'")
-
     if llm_service_config.llm_api_provider == "gemini":
         if not GEMINI_AVAILABLE: return "Error: Gemini library not installed.", None, "GEMINI_LIB_MISSING"
-        if not llm_service_config.gemini_api_key: return "Error: Gemini API key not configured.", None, "GEMINI_KEY_MISSING"
+        if not llm_service_config.gemini_api_key:
+            logger.error("Gemini API key not configured.")
+            return "Error: Gemini API key not configured.", None, "GEMINI_KEY_MISSING"
+
         try:
             genai.configure(api_key=llm_service_config.gemini_api_key)
-            safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            ]
-            model = genai.GenerativeModel(llm_service_config.gemini_model_name)
-            logger.info(f"Sending to Gemini model: {llm_service_config.gemini_model_name}.", extra={"num_content_parts": len(llm_contents_for_request)})
-            response = await model.generate_content_async(llm_contents_for_request, safety_settings=safety_settings)
 
-            if not response.parts:
-                block_reason_detail = "Unknown"; candidate_safety_issues = []
-                if response.prompt_feedback and response.prompt_feedback.block_reason: block_reason_detail = response.prompt_feedback.block_reason.name
-                if response.candidates:
+            current_system_instruction: Optional[str] = None
+            prompt_content_for_llm: Any # Can be string or list of content dicts
+
+            if is_code_generation_request:
+                # Code generation prompt is specific and includes SDK snippet
+                # No separate system prompt needed here as the main prompt is comprehensive.
+                prompt_content_for_llm = f'''User's Strategy Request: "{code_gen_prompt_details}"
+
+IMPORTANT INSTRUCTIONS AND GUIDELINES:
+1.  **SDK Usage:** The generated Python code MUST strictly use the 'Trading Platform Python SDK' functions and classes as defined in the SDK Reference below. Do NOT use any other hypothetical or external trading libraries.
+2.  **Strategy Structure:** The main strategy logic MUST be encapsulated within a class that inherits from `sdk.BaseStrategy`.
+3.  **Core Methods:** Implement `__init__`, `on_start`, `on_bar`, `on_fill`, and `on_stop`.
+4.  **Imports:** Always include `import sdk`. Import `datetime` and `typing` hints as needed.
+5.  **Parameters:** Access parameters via `self.strategy_params.get('param_name', default_value)`.
+6.  **Market Data in `on_bar`:** Use the `current_bar_data_bundle` argument. Use `sdk.get_market_data()` in `on_start()` for history/warm-up only.
+7.  **Order Quantity:** Positive for BUY, negative for SELL.
+8.  **Code Only:** Your response MUST BE ONLY the raw Python code. No explanations or markdown.
+9.  **Completeness & Clarity:** Generate a complete, runnable script with clear comments.
+10. **Error Handling:** Check for `None` returns from SDK calls like `sdk.get_position()`.
+
+{PYTHON_SDK_SNIPPET_FOR_LLM}
+
+Generated Python Code:
+'''
+                logger.debug(f"LLM Code Gen Prompt (summary): User Request='{code_gen_prompt_details}', SDK reference provided.")
+            else: # General chat
+                current_system_instruction = GENERAL_CHAT_SYSTEM_PROMPT
+
+                # Assemble history + RAG-augmented current user message for Gemini
+                history_plus_current_user_message_parts: List[Dict[str, Any]] = []
+                if conversation_history: # Already in Gemini format (list of content dicts)
+                    history_plus_current_user_message_parts.extend(conversation_history)
+
+                current_user_message_content_for_llm = user_message
+                if rag_context:
+                    current_user_message_content_for_llm = f"{rag_context}\n\nUser Query: {user_message}"
+
+                history_plus_current_user_message_parts.append(
+                    {'role': 'user', 'parts': [{'text': current_user_message_content_for_llm}]}
+                )
+                prompt_content_for_llm = history_plus_current_user_message_parts
+                logger.debug(f"LLM General Chat. System Instruction Active. History length: {len(conversation_history or [])}. RAG used: {bool(rag_context)}. Current message starts: '{user_message[:50]}...'")
+
+            # Example safety settings (adjust as needed, BLOCK_NONE is very permissive)
+            # Consider BLOCK_ONLY_HIGH or BLOCK_MEDIUM_AND_ABOVE for production.
+            safety_settings_gemini = {
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            }
+
+            model = genai.GenerativeModel(
+                llm_service_config.gemini_model_name,
+                system_instruction=current_system_instruction, # Pass system instruction here
+                safety_settings=safety_settings_gemini
+            )
+
+            logger.info(f"Sending to Gemini model: {llm_service_config.gemini_model_name}. System instruction active: {bool(current_system_instruction)}.")
+            response = await model.generate_content_async(prompt_content_for_llm) # No need to pass safety_settings again if set in model
+
+            response_text_content = ""
+            # Try to extract text, handling potential differences in response structure
+            if response.parts:
+                response_text_content = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+            elif response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                response_text_content = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+
+            # Check for safety blocks if no content was extracted
+            if not response_text_content:
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    block_reason_detail = response.prompt_feedback.block_reason.name
+                    logger.warning(f"Gemini response blocked by prompt feedback.", extra={"reason": block_reason_detail, "prompt_feedback": str(response.prompt_feedback)})
+                    return f"Response blocked by safety settings (prompt). Reason: {block_reason_detail}", None, "GEMINI_SAFETY_BLOCK"
+
+                candidate_safety_issues = []
+                if response.candidates: # Check candidate-level safety ratings
                     for candidate in response.candidates:
                         if hasattr(candidate, 'finish_reason') and candidate.finish_reason and candidate.finish_reason.name == "SAFETY":
                             for rating in candidate.safety_ratings:
-                                if rating.probability.name not in ["NEGLIGIBLE", "LOW"]: candidate_safety_issues.append(f"{rating.category.name}: {rating.probability.name}")
-                            if candidate_safety_issues: break
-                detailed_safety_msg = "; ".join(candidate_safety_issues) if candidate_safety_issues else block_reason_detail
-                logger.warning(f"Gemini response blocked.", extra={"reason": detailed_safety_msg, "prompt_feedback": str(response.prompt_feedback)})
-                return f"Response blocked by safety settings. Reason: {detailed_safety_msg}", None, "GEMINI_SAFETY_BLOCK"
+                                if rating.probability.name not in ["NEGLIGIBLE", "LOW"]:
+                                    candidate_safety_issues.append(f"{rating.category.name}: {rating.probability.name}")
+                            if candidate_safety_issues: break # Found issues in one candidate
 
-            response_text_content = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                if candidate_safety_issues:
+                    detailed_safety_msg = "; ".join(candidate_safety_issues)
+                    logger.warning(f"Gemini response blocked by candidate safety settings.", extra={"reason": detailed_safety_msg})
+                    return f"Response blocked by safety settings (candidate). Reason: {detailed_safety_msg}", None, "GEMINI_SAFETY_BLOCK"
+
+                if not response.parts and not (response.candidates and response.candidates[0].content.parts): # If truly no parts and no clear safety block
+                    logger.warning("Gemini response had no parts and no explicit safety block. Prompt feedback: " + str(response.prompt_feedback))
+                    return "Received an empty response from the AI assistant.", None, "GEMINI_EMPTY_RESPONSE"
+
+
             if is_code_generation_request:
-                generated_code = response_text_content.strip()
+                generated_code = response_text_content.strip() # Assuming the entire response text is the code
                 if generated_code.startswith("```python"):
                     generated_code = generated_code[len("```python"):].lstrip()
                 elif generated_code.startswith("```"):
@@ -399,6 +446,46 @@ async def chat_with_llm_endpoint(chat_message: ChatMessage = Body(...)):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error processing chat.")
 
 app.include_router(chat_router)
+
+@chat_router.post(
+    "/sessions/{session_id}/clear",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Clear Conversation History for a Specific Session ID"
+    # verify_api_key dependency is inherited from the chat_router
+)
+async def clear_specific_chat_session_history(session_id: str):
+    logger.info(f"API: Request to clear history for session_id: {session_id}")
+    history_manager_instance.clear_history(session_id)
+    # FastAPI will automatically return a 204 No Content response.
+
+@chat_router.post(
+    "/feedback",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit Feedback on a Chatbot Message"
+    # verify_api_key dependency is inherited from the chat_router
+)
+async def submit_chat_feedback(feedback_data: ChatMessageFeedback):
+    logger.info(
+        "Received chat message feedback",
+        extra={
+            "feedback_session_id": feedback_data.session_id,
+            "feedback_message_id": feedback_data.message_id,
+            "feedback_user_id": feedback_data.user_id,
+            "feedback_rating": feedback_data.rating,
+            "feedback_comment": feedback_data.comment,
+            "feedback_bot_message_snippet": feedback_data.bot_message_text_snippet,
+            "feedback_user_query": feedback_data.user_query_that_led_to_this_response
+        }
+    )
+    # For now, just log it. In future, this could write to a DB or analytics.
+    # Example: Log to a dedicated feedback file
+    # try:
+    #     with open("chat_feedback.log", "a", encoding="utf-8") as f:
+    #         f.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} - {feedback_data.model_dump_json(exclude_none=True)}\n")
+    # except Exception as e_log_feedback:
+    #     logger.error(f"Failed to write feedback to file: {e_log_feedback}")
+
+    return {"status": "Feedback received", "session_id": feedback_data.session_id, "message_id": feedback_data.message_id}
 
 @app.get("/health", tags=["Health Check"], summary="Check service health")
 async def health_check():
