@@ -1,39 +1,182 @@
 from .base_tool import BaseTool
-from typing import Any
+from typing import Any, Dict, List
+import json
+import random
+import datetime
+from loguru import logger # Import Loguru
+
+# Custom mock exceptions
+class InternalNewsServiceError(Exception):
+    """Simulates a generic error from the internal news service."""
+    pass
+
+class NoNewsFoundError(Exception):
+    """Simulates an error when no news is found for a given query."""
+    pass
+
+class InvalidNewsQueryError(Exception):
+    """Simulates an error for an invalid or unsupported news query."""
+    pass
+
 
 class NewsAnalysisTool(BaseTool):
     name: str = "get_news_analysis"
-    description: str = "Retrieves recent news articles and their sentiment analysis for a given stock symbol or topic. Parameters: query (str, e.g., stock symbol 'AAPL' or topic 'market trends'), limit (int, number of articles)."
+    description: str = (
+        "Retrieves recent news articles, including their sentiment analysis, for a given stock symbol or topic. "
+        "Parameters: query (str, e.g., stock symbol 'AAPL' or topic 'market trends'), limit (int, number of articles, default 5). "
+        "Returns a JSON string with news articles (title, source, published_at, sentiment, summary) or an error message."
+    )
 
-    def execute(self, query: str, limit: int = 5, **kwargs: Any) -> str:
+    parameter_schema: Dict[str, Dict[str, Any]] = {
+        "query": {
+            "type": "string",
+            "description": "The stock symbol (e.g., 'AAPL') or topic (e.g., 'renewable energy') for which to retrieve news."
+        },
+        "limit": {
+            "type": "integer",
+            "description": "The maximum number of news articles to return. Default is 5."
+        }
+    }
+    required_parameters: List[str] = ["query"] # limit has a default
+
+    async def _generate_mock_article(self, query: str, index: int) -> Dict[str, Any]:
+        """Generates a single mock news article."""
+        sources = ["Reuters", "Bloomberg", "Financial Times", "Wall Street Journal", "MarketWatch"]
+        keywords = ["breakthrough", "challenges", "growth", "decline", "new product", "earnings report", "market sentiment"]
+
+        sentiment_score = round(random.uniform(-1, 1), 2)
+        sentiment_label = "Positive" if sentiment_score > 0.3 else "Negative" if sentiment_score < -0.3 else "Neutral"
+
+        days_ago = random.randint(0, 14)
+        published_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)).isoformat()
+
+        return {
+            "title": f"Article {index+1} about {query}: {random.choice(keywords).capitalize()}",
+            "source": random.choice(sources),
+            "published_at": published_date,
+            "sentiment_score": sentiment_score,
+            "sentiment_label": sentiment_label,
+            "summary": f"This is a mock summary for article {index+1} regarding {query}. "
+                       f"The current sentiment is {sentiment_label.lower()} ({sentiment_score}). "
+                       f"Key topics include {random.choice(keywords)} and {random.choice(keywords)}."
+        }
+
+    async def _fetch_news_from_internal_api(self, query: str, limit: int) -> Dict[str, Any]:
         """
-        Conceptually, this tool would query the platform's news database
-        (which includes news articles and their pre-computed sentiment scores)
-        or call the news/sentiment service created in subtask 8.
-
-        For this PoC, it returns a mock string indicating news analysis.
+        Simulates fetching news articles from an internal news API.
+        This function returns a dictionary structure or raises a mock exception.
         """
-        # In a real implementation:
-        # 1. Validate parameters (query, limit).
-        # 2. Connect to the news data source (e.g., PostgreSQL table or news service API /news?symbol=...).
-        # 3. Fetch news articles and their sentiment scores.
-        # 4. Format data (e.g., a list of headlines with sentiment, or a summary string).
+        logger.debug(f"NewsAnalysisTool: Attempting to fetch news from internal API.", query=query, limit=limit)
 
-        print(f"NewsAnalysisTool: Executing for query='{query}', limit='{limit}'")
+        if query.upper() == "SERVICE_DOWN":
+            raise InternalNewsServiceError("The internal news aggregation service is currently unavailable.")
+        if query.upper() == "NO_RESULTS_FOR_THIS_QUERY":
+            raise NoNewsFoundError(f"No news articles found matching your query: '{query}'.")
+        if len(query) < 3 and query.upper() != "ALL": # Arbitrary validation
+             raise InvalidNewsQueryError(f"Query term '{query}' is too short. Please provide a more specific query.")
 
-        # Mock response
-        mock_news_summary = (
-            f"Found {limit} (mocked) news articles related to '{query}':\n"
-            f"1. '{query} Hits New High!' - Sentiment: Positive (0.85)\n"
-            f"2. 'Concerns over {query} Future Growth' - Sentiment: Negative (-0.60)\n"
-            f"3. '{query} Announces New Product' - Sentiment: Neutral (0.10)\n"
-            f"(Mocked Data)"
-        )
-        return mock_news_summary
+        articles: List[Dict[str, Any]] = []
+        for i in range(limit):
+            # _generate_mock_article is async but doesn't do real I/O, direct await is fine.
+            articles.append(await self._generate_mock_article(query, i))
+
+        logger.debug(f"NewsAnalysisTool: Successfully fetched {len(articles)} mock articles for query '{query}'.",
+                     num_articles=len(articles), query=query)
+        return {
+            "query": query,
+            "limit_requested": limit,
+            "articles_returned": len(articles),
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "articles": articles,
+            "notes": "This is mock data generated by NewsAnalysisTool._fetch_news_from_internal_api"
+        }
+
+    async def execute(self, query: str, limit: int = 5, **kwargs: Any) -> str:
+        """
+        Queries an internal news service to retrieve articles and their sentiment analysis.
+        Formats the data as a JSON string or returns an error message.
+        This method is now async.
+        """
+        logger.info(f"NewsAnalysisTool: Async Execute.", query=query, limit=limit, kwargs=kwargs)
+
+        _query = kwargs.get('query', query)
+        _limit = kwargs.get('limit', limit)
+
+
+        try:
+            if not _query: # Should be caught by 'required' in schema
+                return "Error: A query (e.g., stock symbol or topic) must be provided."
+            if not isinstance(_limit, int) or _limit <= 0 or _limit > 20: # Max 20 articles for mock
+                # This validation is still useful for non-Gemini calls or if Gemini schema fails
+                return "Error: Limit must be a positive integer, not exceeding 20."
+
+            news_data = await self._fetch_news_from_internal_api(_query, _limit)
+
+            logger.debug(f"NewsAnalysisTool: Successfully processed news data for query '{_query}'. Returning JSON string.", query=_query)
+            return json.dumps(news_data, indent=2)
+
+        except InvalidNewsQueryError as e:
+            logger.warning(f"NewsAnalysisTool: Invalid query error for query='{_query}'. Error: {e}", query=_query, error=str(e))
+            return f"Error: Invalid news query. {str(e)}"
+        except NoNewsFoundError as e:
+            logger.warning(f"NewsAnalysisTool: No news found for query='{_query}'. Error: {e}", query=_query, error=str(e))
+            return f"Error: No news articles found for '{_query}'."
+        except InternalNewsServiceError as e:
+            logger.error(f"NewsAnalysisTool: Internal service error for query='{_query}'. Error: {e}", query=_query, error=str(e))
+            return f"Error: Could not retrieve news for '{_query}'. The news service reported an error: {str(e)}"
+        except Exception as e:
+            logger.exception(f"NewsAnalysisTool: An unexpected error occurred for query='{_query}'. Error: {e}", query=_query)
+            return f"Error: An unexpected issue occurred while fetching news for '{_query}'. Details: {str(e)}"
 
 if __name__ == '__main__':
-    tool = NewsAnalysisTool()
-    print(f"Tool Name: {tool.name}")
-    print(f"Tool Description: {tool.description}")
-    output = tool.execute(query="MSFT", limit=3)
-    print(f"Tool Output: {output}")
+    # Basic Loguru setup for testing this module directly
+    import sys
+    logger.remove()
+    logger.add(sys.stderr, level="DEBUG", format="{time} {level} {message} | {extra}")
+
+    tool = NewsAnalysisTool() # This instance is just for top-level name/desc
+    logger.info(f"Tool Name: {tool.name}")
+    logger.info(f"Tool Description: {tool.description}")
+
+    import asyncio
+
+    async def main():
+        tool_instance = NewsAnalysisTool() # Create instance inside async main
+        logger.info(f"Tool Name (async test): {tool_instance.name}")
+        logger.info(f"Tool Description (async test): {tool_instance.description}")
+
+        logger.info("\n--- Gemini Function Declaration Schema ---")
+        gemini_schema = tool_instance.get_description_for_llm()
+        logger.info(f"Schema: {json.dumps(gemini_schema, indent=2)}")
+
+        logger.info("\n--- Test Case 1: Successful Fetch (AAPL) ---")
+        output_aapl = await tool_instance.execute(query="AAPL", limit=3)
+        logger.info(f"Output (AAPL):\n{output_aapl}\n")
+
+        logger.info("\n--- Test Case 2: No News Found (NO_RESULTS_FOR_THIS_QUERY) ---")
+        output_nonews = await tool_instance.execute(query="NO_RESULTS_FOR_THIS_QUERY", limit=5)
+        logger.info(f"Output (No News):\n{output_nonews}\n")
+
+        logger.info("\n--- Test Case 3: Service Error (SERVICE_DOWN) ---")
+        output_service_error = await tool_instance.execute(query="SERVICE_DOWN", limit=2)
+        logger.info(f"Output (Service Error):\n{output_service_error}\n")
+
+        logger.info("\n--- Test Case 4: Invalid Query (short) ---")
+        output_invalid_query = await tool_instance.execute(query="TS", limit=5)
+        logger.info(f"Output (Invalid Query):\n{output_invalid_query}\n")
+
+        logger.info("\n--- Test Case 5: Missing Query ---")
+        output_missing_query = await tool_instance.execute(query="", limit=3)
+        logger.info(f"Output (Missing Query):\n{output_missing_query}\n")
+
+        logger.info("\n--- Test Case 6: Invalid Limit (too high) ---")
+        output_invalid_limit = await tool_instance.execute(query="GOOG", limit=25)
+        logger.info(f"Output (Invalid Limit):\n{output_invalid_limit}\n")
+
+        logger.info("\n--- Test Case 7: Default Limit ---")
+        output_default_limit = await tool_instance.execute(query="NFLX")
+        logger.info(f"Output (Default Limit - NFLX):\n{output_default_limit}\n")
+
+
+    if __name__ == '__main__':
+        asyncio.run(main())

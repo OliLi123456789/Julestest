@@ -1,2 +1,11 @@
 fastapi
 uvicorn[standard]
+boto3
+google-generativeai
+httpx
+faiss-cpu
+sentence-transformers
+loguru
+prometheus-fastapi-instrumentator
+pytest
+pytest-asyncio
