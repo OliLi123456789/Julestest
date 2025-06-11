@@ -29,6 +29,15 @@ class IBKRConfig:
     max_requests_per_second: int = 40 # Stay under IBKR's typical 50 req/sec limit
     max_silence_duration_seconds: int = 90 # New for stale connection detection
 
+    # New configurable parameters
+    market_data_type: int
+    default_contract_resolution_timeout_seconds: int
+    default_order_placement_timeout_seconds: float
+    default_account_data_timeout_seconds: int
+    default_pnl_timeout_seconds: int
+    default_position_timeout_seconds: int
+    max_concurrent_api_requests: int
+
 class KafkaConfig:  # For publishing responses/events from IBKR
     bootstrap_servers: str
     order_updates_topic: str
@@ -36,6 +45,13 @@ class KafkaConfig:  # For publishing responses/events from IBKR
     account_data_topic: str
     position_data_topic: str
     error_events_topic: str
+
+    # New configurable parameters
+    processor_idle_sleep_ms: int
+    processor_stop_timeout_seconds: int
+    account_value_updates_topic: str
+    market_data_ticks_topic: str
+    market_data_bars_topic: str
 
 class LeaderElectionConfig:
     lease_name: str
@@ -51,6 +67,7 @@ class Config:
     aws_region: str
     service_instance_id: str
     log_level: str = "INFO"
+    health_check_port: int
 
 def load_config() -> Config:
     aws_region = os.getenv("AWS_REGION")
@@ -85,9 +102,16 @@ def load_config() -> Config:
             max_reconnect_attempts=int(os.getenv("IBKR_MAX_RECONNECT_ATTEMPTS", "0")),
         reconnect_interval_seconds=int(os.getenv("IBKR_RECONNECT_INTERVAL_SECONDS", "15")),
         max_requests_per_second=int(os.getenv("IBKR_MAX_REQUESTS_PER_SECOND", "40")),
-            max_silence_duration_seconds=int(os.getenv("IBKR_MAX_SILENCE_SECONDS", "90")) # Load new config
+        max_silence_duration_seconds=int(os.getenv("IBKR_MAX_SILENCE_SECONDS", "90")), # Load new config
         # ib_controller_url=os.getenv("IB_CONTROLLER_URL"),
         # ib_key_totp_secret_name=os.getenv("IB_KEY_TOTP_SECRET_NAME")
+        market_data_type=int(os.getenv("IBKR_MARKET_DATA_TYPE", "2")),
+        default_contract_resolution_timeout_seconds=int(os.getenv("IBKR_DEFAULT_CONTRACT_RESOLUTION_TIMEOUT_SECONDS", "10")),
+        default_order_placement_timeout_seconds=float(os.getenv("IBKR_DEFAULT_ORDER_PLACEMENT_TIMEOUT_SECONDS", "5.0")),
+        default_account_data_timeout_seconds=int(os.getenv("IBKR_DEFAULT_ACCOUNT_DATA_TIMEOUT_SECONDS", "10")),
+        default_pnl_timeout_seconds=int(os.getenv("IBKR_DEFAULT_PNL_TIMEOUT_SECONDS", "10")),
+        default_position_timeout_seconds=int(os.getenv("IBKR_DEFAULT_POSITION_TIMEOUT_SECONDS", "10")),
+        max_concurrent_api_requests=int(os.getenv("IBKR_MAX_CONCURRENT_REQUESTS", "10"))
     )
 
     kafka_config = KafkaConfig(
@@ -96,7 +120,12 @@ def load_config() -> Config:
         execution_reports_topic=os.getenv("KAFKA_EXECUTION_REPORTS_TOPIC", "ibkr.execution-reports"),
         account_data_topic=os.getenv("KAFKA_ACCOUNT_DATA_TOPIC", "ibkr.account-data"),
         position_data_topic=os.getenv("KAFKA_POSITION_DATA_TOPIC", "ibkr.position-data"),
-        error_events_topic=os.getenv("KAFKA_ERROR_EVENTS_TOPIC", "ibkr.error-events")
+        error_events_topic=os.getenv("KAFKA_ERROR_EVENTS_TOPIC", "ibkr.error-events"),
+        processor_idle_sleep_ms=int(os.getenv("KAFKA_PROCESSOR_IDLE_SLEEP_MS", "10")),
+        processor_stop_timeout_seconds=int(os.getenv("KAFKA_PROCESSOR_STOP_TIMEOUT_SECONDS", "10")),
+        account_value_updates_topic=os.getenv("KAFKA_ACCOUNT_VALUE_UPDATES_TOPIC", "ibkr.account-value-updates"),
+        market_data_ticks_topic=os.getenv("KAFKA_MARKET_DATA_TICKS_TOPIC", "ibkr.market-data.ticks"),
+        market_data_bars_topic=os.getenv("KAFKA_MARKET_DATA_BARS_TOPIC", "ibkr.market-data.bars")
     )
 
     log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -117,10 +146,32 @@ def load_config() -> Config:
         retry_period_seconds=int(os.getenv("LEADER_ELECTION_RETRY_PERIOD_SECONDS", "2"))
     )
 
-    logger.info(f"IBKR Config Loaded: Host={ibkr_config.gateway_host}:{ibkr_config.gateway_port}, ClientID={ibkr_config.client_id}")
+    logger.info(f"IBKR Config Loaded: Host={ibkr_config.gateway_host}:{ibkr_config.gateway_port}, ClientID={ibkr_config.client_id}, Account={ibkr_config.account_code}")
+    logger.info(f"IBKR Market Data Type: {ibkr_config.market_data_type}")
+    logger.info(f"IBKR Max Silence Duration: {ibkr_config.max_silence_duration_seconds}s")
+    logger.info(f"IBKR Default Contract Resolution Timeout: {ibkr_config.default_contract_resolution_timeout_seconds}s")
+    logger.info(f"IBKR Default Order Placement Timeout: {ibkr_config.default_order_placement_timeout_seconds}s")
+    logger.info(f"IBKR Default Account Data Timeout: {ibkr_config.default_account_data_timeout_seconds}s")
+    logger.info(f"IBKR Default PnL Timeout: {ibkr_config.default_pnl_timeout_seconds}s")
+    logger.info(f"IBKR Default Position Timeout: {ibkr_config.default_position_timeout_seconds}s")
+    logger.info(f"IBKR Max Concurrent API Requests: {ibkr_config.max_concurrent_api_requests}")
+
     logger.info(f"Kafka Config Loaded: Brokers='{kafka_config.bootstrap_servers}'")
+    logger.info(f"Kafka Order Updates Topic: {kafka_config.order_updates_topic}")
+    logger.info(f"Kafka Execution Reports Topic: {kafka_config.execution_reports_topic}")
+    logger.info(f"Kafka Account Data Topic: {kafka_config.account_data_topic}")
+    logger.info(f"Kafka Position Data Topic: {kafka_config.position_data_topic}")
+    logger.info(f"Kafka Error Events Topic: {kafka_config.error_events_topic}")
+    logger.info(f"Kafka Processor Idle Sleep: {kafka_config.processor_idle_sleep_ms}ms")
+    logger.info(f"Kafka Processor Stop Timeout: {kafka_config.processor_stop_timeout_seconds}s")
+    logger.info(f"Kafka Account Value Updates Topic: {kafka_config.account_value_updates_topic}")
+    logger.info(f"Kafka Market Data Ticks Topic: {kafka_config.market_data_ticks_topic}")
+    logger.info(f"Kafka Market Data Bars Topic: {kafka_config.market_data_bars_topic}")
+
     logger.info(f"LeaderElection Config Loaded: LeaseName='{leader_election_config.lease_name}', Namespace='{leader_election_config.lease_namespace}'")
 
+    health_check_port=int(os.getenv("HEALTH_CHECK_PORT", "8080"))
+    logger.info(f"Health Check Port: {health_check_port}")
 
     return Config(
         aws_region=aws_region,
@@ -128,5 +179,6 @@ def load_config() -> Config:
         ibkr=ibkr_config,
         kafka=kafka_config,
         leader_election=leader_election_config,
-        log_level=log_level_str
+        log_level=log_level_str,
+        health_check_port=health_check_port
     )

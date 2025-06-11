@@ -1,0 +1,8 @@
+# Example: Add any libraries your user_strategy.py might need.
+# These will be installed via pip during the Docker image build.
+simplejson
+requests # For NewsFetcher service or strategies calling external APIs
+nltk     # For NLTK VADER sentiment analysis
+# pendulum
+# numpy # Often useful, but pandas (installed for SDK) might bring it in.
+# pandas # Already installed in Dockerfile as a common SDK dependency.

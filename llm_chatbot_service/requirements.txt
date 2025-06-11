@@ -1,2 +1,14 @@
 fastapi
 uvicorn[standard]
+httpx
+google-generativeai # For Gemini
+python-dotenv # Optional, for local .env management
+python-json-logger # For structured JSON logging
+
+# For RAG
+sentence-transformers
+faiss-cpu
+numpy # Often needed with faiss and sentence-transformers
+# Add other specific dependencies for tools later if needed
+# PyYAML is used by backtester's config_loader, if that's run from here or shared.
+# For now, only LLM service specific deps.

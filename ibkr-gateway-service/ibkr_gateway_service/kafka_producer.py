@@ -1,4 +1,5 @@
 import logging
+import time # Added for health check
 from confluent_kafka import Producer #type: ignore
 from google.protobuf.message import Message as ProtoMessage #type: ignore
 from typing import Optional
@@ -43,6 +44,8 @@ class BrokerEventProducer:
 
         self.delivery_reports_processed = 0
         self.delivery_errors = 0
+        self._is_healthy = True # Health flag
+        self._last_produce_error_ts: Optional[float] = None # Timestamp of last persistent error
 
         # Start a goroutine (in Go) or thread (in Python) for handling delivery reports
         # For Python client, poll() in produce or flush() handles this.
@@ -55,8 +58,16 @@ class BrokerEventProducer:
         if err is not None:
             self.delivery_errors += 1
             logger.error(f'BrokerEvent delivery failed for topic {msg.topic()} key {msg.key()}: {err}')
-            # TODO: More robust DLQ or error handling for critical event delivery failures
+            # Consider marking unhealthy on persistent errors.
+            # For example, if specific error codes from `err` indicate a persistent issue.
+            # err is a KafkaError object. err.code() gives specific error codes.
+            # Example: if err.fatal(): self._is_healthy = False; self._last_produce_error_ts = time.time()
+            # This needs careful selection of which errors are truly unrecoverable by the client.
         else:
+            # Successful delivery could potentially mark as healthy if previously unhealthy and error condition cleared.
+            # if not self._is_healthy and self._last_produce_error_ts and (time.time() - self._last_produce_error_ts > SOME_RECOVERY_THRESHOLD_SECONDS):
+            #    self._is_healthy = True # Or after a few successful publishes
+            #    logger.info("KafkaProducer marked as healthy again after successful publish.")
             # This can be very verbose, enable only for debugging.
             # logger.debug(f'BrokerEvent delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()} (Key: {msg.key()})')
             pass
@@ -98,8 +109,36 @@ class BrokerEventProducer:
                 self.producer.poll(0)
             except Exception as e_retry:
                  logger.error(f"BrokerEventProducer: Error publishing message (after retry for BufferError) for key {key} to {topic}: {e_retry}", exc_info=True)
+                 # This could be a point to mark unhealthy if retries fail consistently
+                 self._is_healthy = False
+                 self._last_produce_error_ts = time.time()
+                 logger.critical(f"KafkaProducer marked as unhealthy due to persistent publishing failure (BufferError retry) for topic {topic}.")
         except Exception as e:
             logger.error(f"BrokerEventProducer: Error publishing message with key {key} to {topic}: {e}", exc_info=True)
+            # This could also be a point to mark unhealthy depending on the exception type
+            # For example, if it's a configuration error or authentication failure.
+            # For now, only BufferError after retry explicitly marks unhealthy.
+            # Consider adding:
+            # self._is_healthy = False
+            # self._last_produce_error_ts = time.time()
+            # logger.critical(f"KafkaProducer marked as unhealthy due to publishing failure for topic {topic}.")
+
+
+    def is_healthy(self) -> bool:
+        # A more sophisticated check could involve:
+        # - Checking producer.poll(0) for any immediate non-fatal errors if the client provides such status.
+        # - Checking if the last known error (_last_produce_error_ts) is recent and implies a persistent problem.
+        # - For now, it becomes unhealthy on critical publish errors and stays that way.
+        #   Recovery to healthy might need a successful publish or a timer.
+        if not self._is_healthy and self._last_produce_error_ts:
+            # Example: try to become healthy again if last error was some time ago and we haven't had new ones.
+            # This is a simplistic recovery idea. True recovery might need more checks.
+            if (time.time() - self._last_produce_error_ts) > 300: # e.g., 5 minutes
+                # Attempt a benign check or assume if no new errors, it might be ok.
+                # For now, let's say it needs a successful publish to recover.
+                # Or, for a health endpoint, just report current _is_healthy state.
+                pass # Stays unhealthy until a more robust recovery is implemented
+        return self._is_healthy
 
     def flush(self, timeout_seconds: int = 15):
         """

@@ -1,45 +1,61 @@
 import React, { useState } from 'react';
+import { notificationService } from '../services/notificationService'; // Import notificationService
 
 function OrderEntryForm({ apiToken, onOrderSubmit }) {
   const [symbol, setSymbol] = useState('AAPL'); // Default symbol
   const [quantity, setQuantity] = useState('');
   const [orderType, setOrderType] = useState('MARKET'); // 'MARKET' or 'LIMIT'
   const [price, setPrice] = useState(''); // Only for LIMIT orders
-  const [message, setMessage] = useState(''); // For success/error messages
+  const [message, setMessage] = useState(''); // For local success/error messages in form
 
   const handleSubmit = async (event) => {
     event.preventDefault();
-    setMessage('');
+    setMessage(''); // Clear previous local messages
 
     if (!apiToken) {
-        setMessage('Error: You are not logged in.');
+        const errMsg = 'You must be logged in to submit an order.';
+        setMessage(errMsg);
+        notificationService.showError(errMsg);
         return;
     }
 
-    if (!symbol || !quantity) {
-        setMessage('Symbol and Quantity are required.');
+    if (!symbol.trim() || !quantity.trim()) {
+        const errMsg = 'Symbol and Quantity are required.';
+        setMessage(errMsg);
+        notificationService.showWarning(errMsg);
         return;
     }
-    if (orderType === 'LIMIT' && !price) {
-        setMessage('Price is required for LIMIT orders.');
+    if (orderType === 'LIMIT' && !price.trim()) {
+        const errMsg = 'Price is required for LIMIT orders.';
+        setMessage(errMsg);
+        notificationService.showWarning(errMsg);
         return;
     }
+
     const qty = parseInt(quantity, 10);
     if (isNaN(qty) || qty <= 0) {
-        setMessage('Quantity must be a positive number.');
+        const errMsg = 'Quantity must be a positive number.';
+        setMessage(errMsg);
+        notificationService.showWarning(errMsg);
         return;
     }
-    const prc = orderType === 'LIMIT' ? parseFloat(price) : null;
-    if (orderType === 'LIMIT' && (isNaN(prc) || prc <= 0)) {
-        setMessage('Price must be a positive number for LIMIT orders.');
-        return;
+
+    let prc = null;
+    if (orderType === 'LIMIT') {
+        prc = parseFloat(price);
+        if (isNaN(prc) || prc <= 0) {
+            const errMsg = 'Price must be a positive number for LIMIT orders.';
+            setMessage(errMsg);
+            notificationService.showWarning(errMsg);
+            return;
+        }
     }
 
     const orderData = {
-      symbol,
+      symbol: symbol.trim().toUpperCase(),
       quantity: qty,
       order_type: orderType,
-      price: prc,
+      price: prc, // Will be null for MARKET orders
     };
 
     try {
@@ -47,25 +63,45 @@ function OrderEntryForm({ apiToken, onOrderSubmit }) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-token': apiToken, // Send the mock token in the header
+          'Authorization': `Bearer ${apiToken}`,
         },
         body: JSON.stringify(orderData),
       });
 
-      const responseData = await response.json();
+      // Try to parse JSON regardless of response.ok, as FastAPI often sends JSON error details
+      let responseData;
+      try {
+          responseData = await response.json();
+      } catch (jsonError) {
+          // If JSON parsing fails, use text content if available, or status text
+          const responseText = await response.text().catch(() => response.statusText);
+          responseData = { detail: responseText || response.statusText };
+          console.error("Order submission: Non-JSON response or JSON parse error", responseData.detail);
+      }
+
       if (response.ok) {
-        setMessage(`Order submitted successfully! Order ID: ${responseData.order_id}, Status: ${responseData.status}`);
-        if(onOrderSubmit) onOrderSubmit(responseData); // Callback for parent component
-        // Clear form
-        // setSymbol(''); // Or keep symbol for next order
+        const successMsg = `Order ${responseData.order_id || orderData.symbol} submitted (${responseData.status || 'processing'}).`;
+        setMessage(successMsg); // Local message
+        notificationService.showSuccess(`Order for ${orderData.symbol} submitted. ID: ${responseData.order_id}`);
+
+        if(onOrderSubmit) onOrderSubmit(responseData);
+
+        // Clear form fields for next order
         setQuantity('');
         setPrice('');
+        // Optionally keep symbol: setSymbol('AAPL'); or clear: setSymbol('');
       } else {
-        setMessage(`Error: ${responseData.detail || 'Failed to submit order'}`);
+        // Use detail from JSON response if available, otherwise default message
+        const errorDetail = responseData.detail?.message || responseData.detail || 'Failed to submit order. Please try again.';
+        setMessage(`Error: ${errorDetail}`); // Local message
+        notificationService.showError(`Order Error: ${errorDetail}`);
       }
     } catch (err) {
-      setMessage(`Network error: ${err.message}`);
-      console.error("Order submission error:", err);
+      // Network error or other issues
+      const networkErrorMsg = `Order submission failed: ${err.message || "Network error"}`;
+      setMessage(networkErrorMsg); // Local message
+      notificationService.showError(networkErrorMsg);
+      console.error("Order submission error (catch block):", err);
     }
   };
 
@@ -79,7 +115,7 @@ function OrderEntryForm({ apiToken, onOrderSubmit }) {
             type="text"
             id="symbol"
             value={symbol}
-            onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+            onChange={(e) => setSymbol(e.target.value)} // Uppercasing moved to submit
             required
           />
         </div>
@@ -95,7 +131,7 @@ function OrderEntryForm({ apiToken, onOrderSubmit }) {
         </div>
         <div>
           <label htmlFor="orderType">Order Type:</label>
-          <select id="orderType" value={orderType} onChange={(e) => setOrderType(e.target.value)}>
+          <select id="orderType" value={orderType} onChange={(e) => { setOrderType(e.target.value); if (e.target.value === 'MARKET') setPrice(''); }}>
             <option value="MARKET">Market</option>
             <option value="LIMIT">Limit</option>
           </select>
@@ -109,7 +145,7 @@ function OrderEntryForm({ apiToken, onOrderSubmit }) {
               value={price}
               onChange={(e) => setPrice(e.target.value)}
               step="0.01"
-              required
+              required={orderType === 'LIMIT'} // Required only if orderType is LIMIT
             />
           </div>
         )}

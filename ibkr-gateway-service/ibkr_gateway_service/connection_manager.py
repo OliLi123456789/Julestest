@@ -1,4 +1,5 @@
 import logging
+import random
 import threading
 import time
 from typing import Optional, Any # Any for EWrapper placeholder for now
@@ -116,8 +117,8 @@ class ConnectionManager:
         # Request market data type (important for some API behaviors)
         # 1: Live, 2: Frozen, 3: Delayed, 4: Delayed Frozen
         # Use Frozen for paper accounts or if live data isn't from IBKR.
-        self.client.reqMarketDataType(2)
-        logger.info("ConnectionManager: Requested market data type 2 (Frozen).")
+        self.client.reqMarketDataType(self.config.market_data_type)
+        logger.info(f"ConnectionManager: Requested market data type {self.config.market_data_type}.")
         return True # Connection successful
 
     def _connection_loop(self):
@@ -128,13 +129,16 @@ class ConnectionManager:
         while not self.stop_event.is_set():
             if not self.is_api_ready(): # Checks connected_event and next_valid_id_event
                 if attempts > 0: # Apply backoff only after the first actual attempt
-                    # Exponential backoff with jitter (simplified for brevity here, use proper algo)
-                    backoff_seconds = min(self.config.reconnect_interval_seconds * (2 ** (attempts -1)), 60) # Max 60s
-                    jitter = (time.time() * 1000) % 1000 / 1000 # Simple sub-second jitter
-                    sleep_duration = time.Duration(float(backoff_seconds) + jitter) * time.Second
+                    base_backoff_seconds = min(self.config.reconnect_interval_seconds * (2 ** (attempts - 1)), 60) # Max 60s
 
-                    logger.info(f"ConnectionManager: Connection unavailable. Waiting {sleep_duration} before reconnect attempt #{attempts + 1}.")
-                    if self.stop_event.wait(sleep_duration): # Wait or until stop is signaled
+                    # Calculate jitter
+                    max_jitter = self.config.reconnect_interval_seconds * 0.1 # 10% of the base interval for jitter
+                    actual_jitter = random.uniform(-max_jitter, max_jitter)
+
+                    sleep_duration = max(0.5, base_backoff_seconds + actual_jitter) # Ensure minimum sleep, prevent negative
+
+                    logger.info(f"ConnectionManager: Connection unavailable. Waiting {sleep_duration:.2f}s (backoff: {base_backoff_seconds:.2f}s, jitter: {actual_jitter:.2f}s) before reconnect attempt #{attempts + 1}.")
+                    if self.stop_event.wait(timeout=sleep_duration): # Wait or until stop is signaled
                         logger.info("ConnectionManager: Stop event received during reconnect wait.")
                         break
 

@@ -30,9 +30,11 @@ class AbstractStrategy(ABC):
     Abstract base class for trading strategies.
     Strategies generate SignalEvents based on MarketDataEvents.
     """
-    def __init__(self, symbols: list[str]):
+    def __init__(self, symbols: list[str], **kwargs): # Added **kwargs
         self.symbols = symbols
+        self.strategy_params = kwargs # Store additional parameters
         self.active_signals = [] # List to store generated signals
+        # logger.debug(f"Strategy {self.__class__.__name__} initialized with params: {self.strategy_params}") # Requires logger
 
     @abstractmethod
     def calculate_signals(self, event: MarketDataEvent) -> list[SignalEvent]:
@@ -54,9 +56,11 @@ class BuyAndHoldStrategy(AbstractStrategy):
     Buys a fixed quantity of each symbol on the first bar of data received
     and then holds.
     """
-    def __init__(self, symbols: list[str], initial_quantity: int = 100):
-        super().__init__(symbols)
+    def __init__(self, symbols: list[str], initial_quantity: int = 100, **kwargs): # Added **kwargs
+        super().__init__(symbols, **kwargs) # Pass kwargs to parent
         self.initial_quantity = initial_quantity
+        # Example of using a parameter from kwargs if needed:
+        # self.some_other_param = self.strategy_params.get("some_other_param_name", default_value)
         self.invested = {symbol: False for symbol in symbols}
 
     def calculate_signals(self, event: MarketDataEvent) -> list[SignalEvent]:

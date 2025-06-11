@@ -1,324 +1,441 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, APIRouter, Depends, status
 from pydantic import BaseModel
 import os
 import datetime
+import logging
+import time
+import uuid
+from typing import List, Dict, Optional, Any
 
-# --- Configuration & API Key Management (Conceptual for now) ---
-# In a real application, use environment variables or a proper secrets manager.
-# For this PoC, we are MOCKING the LLM call, so no actual key is used yet.
-# Example of how one might access an API key if it were needed:
-LLM_API_PROVIDER = os.getenv("LLM_API_PROVIDER", "mock").lower() # "gemini", "deepseek", or "mock"
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-
-if LLM_API_PROVIDER != "mock" and not LLM_API_KEY:
-    print(f"Warning: LLM_API_PROVIDER is '{LLM_API_PROVIDER}' but LLM_API_KEY environment variable not set.")
-    # In a real app, you might raise an error or disable LLM features here.
-elif LLM_API_PROVIDER == "mock":
-    print("LLM_API_PROVIDER set to 'mock'. LLM calls will be simulated.")
-else:
-    print(f"LLM_API_PROVIDER set to '{LLM_API_PROVIDER}'. LLM_API_KEY is configured.")
+# Import configuration
+from .config_llm import llm_service_config
+# Import auth dependency
+from .auth_llm import verify_api_key
+# Import history manager
+from .history_manager import history_manager_instance
+# Import RAG Retriever
+from .rag.retriever import Retriever, FAISS_ST_AVAILABLE_RETR
+# Import shared logging setup
+from .logging_llm import setup_llm_service_logging, LLM_SERVICE_ROOT_LOGGER_NAME
 
 
-# Placeholder for tool registration and RAG components
+# Call logging setup at the very beginning of the script
+# Pass log level from config. This configures the LLM_SERVICE_ROOT_LOGGER_NAME.
+setup_llm_service_logging(log_level_str=llm_service_config.llm_service_log_level)
+# Get a child logger for this specific file/module
+logger = logging.getLogger(f"{LLM_SERVICE_ROOT_LOGGER_NAME}.main_api")
+
+
+# Import LLM provider SDKs (Gemini for now)
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    logger.warning("google-generativeai package not found. Gemini provider will not be available.")
+
+
+# Tools
 from .tools.chart_data_tool import ChartDataTool
 from .tools.news_analysis_tool import NewsAnalysisTool
 from .tools.earnings_analysis_tool import EarningsAnalysisTool
-# from .rag import Retriever # Placeholder
+
+# Initialize Retriever Instance
+retriever_instance: Optional[Retriever] = None
+if FAISS_ST_AVAILABLE_RETR:
+    try:
+        retriever_instance = Retriever()
+        logger.info("Retriever instance initialized successfully.")
+        if not retriever_instance.index or not retriever_instance.model or (hasattr(retriever_instance.index, 'ntotal') and retriever_instance.index.ntotal == 0) :
+             logger.warning("Retriever initialized, but RAG resources (index/model) might be missing or index is empty. RAG may be disabled or limited. Run build_rag_index.py.")
+    except Exception as e_retriever_init:
+        logger.error(f"Failed to initialize Retriever: {e_retriever_init}", exc_info=True)
+        retriever_instance = None
+else:
+    logger.warning("FAISS or SentenceTransformers not available. RAG features will be disabled.")
 
 
 app = FastAPI(
     title="LLM Chatbot Service",
-    description="Service to interact with an LLM for chatbot functionality.",
-    version="0.1.0"
+    description="Service to interact with an LLM, augmented by RAG and Tools, for chatbot functionality and code generation.",
+    version="0.1.5" # Incremented version
 )
 
 # --- Request and Response Models ---
 class ChatMessage(BaseModel):
-    user_id: str # To identify the user session, for context management later
+    user_id: str
     message: str
-    session_id: str | None = None # Optional: For multi-turn conversation tracking
+    session_id: Optional[str] = None
 
 class LLMResponse(BaseModel):
-    llm_service_name: str # e.g., "MockLLM/DeepSeek_Emulated"
+    llm_service_name: str
     original_message: str
     response_text: str
     timestamp: datetime.datetime
-    tool_used: str | None = None # To indicate if a tool was used
-    tool_response: str | None = None # Raw response from the tool
-    generated_code: str | None = None # For code generation responses
-    error_message: str | None = None
+    session_id: str
+    tool_used: Optional[str] = None
+    tool_response: Optional[str] = None # This will be the summary_text from the tool
+    structured_tool_data: Optional[Any] = None # For raw JSON-like data from tool
+    tool_data_type: Optional[str] = None # e.g., "news_articles", "earnings_reports"
+    generated_code: Optional[str] = None
+    error_message: Optional[str] = None
+    rag_context_used: Optional[bool] = False
 
-PYTHON_SDK_SNIPPET_FOR_LLM = """
-# --- Trading Platform Python SDK Snippet ---
-# Available functions:
-#
-# import sdk # Standard import
-#
-# def log(message: str):
-#   """Logs a message to the platform's logging system."""
-#
-# def get_market_data(symbol: str, timeframe: str = "1d", lookback_period: int = 10) -> list[dict]:
-#   """Retrieves historical market data. Each item in the list is a dict:
-#      {"timestamp": "YYYY-MM-DDTHH:MM:SSZ", "open": float, "high": float, "low": float, "close": float, "volume": int}"""
-#
-# def submit_order(symbol: str, order_type: str, quantity: int, price: float = None, tif: str = "GTC") -> dict:
-#   """Submits a trading order. order_type can be "MARKET" or "LIMIT".
-#      Returns a dict with order confirmation, e.g., {"status": "ACCEPTED", "order_id": "ORD-123", ...}"""
-#
-# def get_portfolio_summary() -> dict:
-#   """Retrieves current cash and positions.
-#      Returns a dict: {"cash": float, "positions": {"SYMBOL": {"quantity": int, "average_price": float}}}"""
-#
-# # Example Strategy Structure (User can define their own structure or use a provided base class)
-# # class MyStrategy:
-# #   def __init__(self):
-# #     sdk.log("Strategy initialized")
-# #   def on_bar(self, symbol, bar_data): # This method name might be part of a platform convention
-# #     sdk.log(f"Processing {symbol}: {bar_data['close']}")
-# #     # ... strategy logic ...
-# #     if some_condition:
-# #       sdk.submit_order(symbol, "MARKET", 10)
-# --- End of SDK Snippet ---
-"""
+# --- SDK Snippet ---
+PYTHON_SDK_SNIPPET_FOR_LLM = '''
+# --- Trading Platform Python SDK Reference ---
+# Your strategy code should primarily use these functions.
+# Ensure you `import sdk` at the beginning of your strategy file.
 
-# --- (Mocked) Live LLM Interaction ---
+# Logging:
+# sdk.log(message: Any, level: str = "INFO", **extra_fields)
+#   # Logs a message. level can be "DEBUG", "INFO", "WARNING", "ERROR".
+#   # e.g., sdk.log(f"Price for {symbol} is {price}", custom_info="some_value")
+
+# Market Data:
+# sdk.get_market_data(symbol: str, timeframe: str = "1d",
+#                     start_date: Optional[str] = None, # "YYYY-MM-DD"
+#                     end_date: Optional[str] = None,   # "YYYY-MM-DD"
+#                     lookback_rows: Optional[int] = None) -> List[Dict[str, Any]]
+#   # Retrieves historical market data as a list of bars.
+#   # Each bar is a dict: {"timestamp": "ISO_ZULU_STR", "OPEN": float, "HIGH": float, "LOW": float, "CLOSE": float, "VOLUME": float}
+#   # Note: For current bar data within on_bar(), use the 'current_bar_data_bundle' argument instead of calling this.
+#   # e.g., history = sdk.get_market_data("AAPL", lookback_rows=50) # For on_start() warm-up
+
+# Order Submission:
+# sdk.submit_order(symbol: str, order_type: str, quantity: float,
+#                  price: Optional[float] = None, tif: str = "GTC", # Time In Force (not heavily used by backtester)
+#                  stop_price: Optional[float] = None,
+#                  trailing_percent: Optional[float] = None, # e.g., 0.5 for 0.5%
+#                  trailing_amount: Optional[float] = None,  # e.g., 0.10 for $0.10 currency offset
+#                  trail_stop_price: Optional[float] = None) -> Dict[str, Any] # Initial trigger for TRAIL
+#   # Submits a trading order. `quantity` is positive for BUY, negative for SELL.
+#   # `order_type` (str): "MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAIL".
+#   # `price`: Required for LIMIT, STOP_LIMIT (as the limit price).
+#   # `stop_price`: Required for STOP, STOP_LIMIT (as the stop trigger price).
+#   # `trailing_percent` OR `trailing_amount`: One is required for TRAIL orders.
+#   # `trail_stop_price`: Optional initial stop price that activates the trail for TRAIL orders.
+#   # Returns dict like: {"status": "PENDING_SUBMIT" or "REJECTED", "order_id": "ORD_...", ...}
+#   # e.g., sdk.submit_order("MSFT", "LIMIT", 10, price=300.0)
+#   # e.g., sdk.submit_order("TSLA", "STOP", -5, stop_price=250.0) # Sell 5 TSLA if price drops to 250
+
+# Portfolio Information (reflects state from backtester when in backtest mode):
+# sdk.get_portfolio_summary() -> Dict[str, Any]
+#   # Retrieves current cash, total portfolio value, and list of positions.
+#   # Example return: {"timestamp": "...", "cash": 10000.0, "total_portfolio_value": 10500.0,
+#   #                  "positions_value": 500.0,
+#   #                  "positions": [{"symbol": "AAPL", "quantity": 10, "average_price": 150.0,
+#   #                                 "market_value": 1550.0, "cost_basis": 1500.0}]}
+
+# sdk.get_position(symbol: str) -> Optional[Dict[str, Any]]
+#   # Retrieves details for a specific position including current MTM value. Returns None if no position.
+#   # Example return: {"symbol": "AAPL", "quantity": 10, "average_price": 150.0, "cost_basis": 1500.0,
+#   #                  "current_market_price": 155.0, "market_value": 1550.0, "timestamp": "..."}
+
+# Base Strategy Class (Your strategy should inherit from this):
+# import sdk
+# import datetime # For type hints in on_bar
+# from typing import Dict, Any, List, Optional # For type hints
+
+# class YourStrategyName(sdk.BaseStrategy):
+#     def __init__(self, strategy_id: str, symbols_of_interest: List[str], **strategy_params):
+#         super().__init__(strategy_id, symbols_of_interest, **strategy_params)
+#         # Access config params: self.my_param = self.strategy_params.get("my_config_param_name", default_value)
+#         # sdk.log(f"{self.strategy_id} initialized with params: {self.strategy_params}")
+
+#     def on_start(self): # Called once at the start of the backtest.
+#         # sdk.log(f"{self.strategy_id}: on_start called.")
+#         pass
+
+#     def on_bar(self, timestamp: datetime.datetime, current_bar_data_bundle: Dict[str, Dict[str, Any]]):
+#         # current_bar_data_bundle format: {'SYMBOL': {'OPEN': ..., 'HIGH':..., 'LOW':..., 'CLOSE':..., 'VOLUME':..., 'timestamp': 'ISO_ZULU_STR'}}
+#         # This method is called for every new bar of data. Implement your trading logic here.
+#         # for symbol, bar_data in current_bar_data_bundle.items():
+#         #     if bar_data['CLOSE'] > 100: sdk.submit_order(symbol, "MARKET", 10) # Example
+#         pass
+
+#     def on_fill(self, fill_info: Dict[str, Any]): # Called when one of your orders is filled.
+#         # fill_info format: {"timestamp": "ISO_ZULU_STR", "symbol": str, "quantity": float, "direction": "BUY"/"SELL",
+#         #                    "fill_price": float, "commission": float, "realized_pnl": Optional[float]}
+#         # sdk.log(f"{self.strategy_id} received fill: {fill_info['symbol']} Qty {fill_info['quantity']} @ Px {fill_info['fill_price']}", level="INFO")
+#         pass
+
+#     def on_stop(self): # Called once at the end of the backtest.
+#         # sdk.log(f"{self.strategy_id}: on_stop called.")
+#         pass
+# --- End of SDK Reference ---
+# '''
+
 async def get_live_llm_response(
-    user_message: str,
-    user_id: str,
-    session_id: str | None,
+    user_message: str, user_id: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    rag_context: Optional[str] = None,
     is_code_generation_request: bool = False,
-    code_gen_prompt_details: str = "" # e.g., "Python strategy for EMA crossover"
-) -> tuple[str, str | None]: # Returns (response_text, generated_code_or_none)
-    """
-    Simulates a live call to an LLM API (e.g., Gemini or DeepSeek).
-    For this PoC, it still returns a mock response but outlines where live calls would go.
-    If is_code_generation_request is True, it returns a mock code string.
-    """
-    print(f"LLM Interface: Attempting to get 'live' response for user '{user_id}', message: '{user_message}' using provider: {LLM_API_PROVIDER}")
-    print(f"LLM Interface: Code generation request: {is_code_generation_request}")
+    code_gen_prompt_details: str = ""
+) -> tuple[str, str | None, Optional[str]]:
+
+    logger.info("LLM Request", extra={
+        "user_id": user_id, "provider": llm_service_config.llm_api_provider,
+        "code_gen": is_code_generation_request, "history_len": len(conversation_history) if conversation_history else 0,
+        "rag_used": rag_context is not None
+    })
+
+    llm_contents_for_request: List[Any] = []
 
     if is_code_generation_request:
-        # Construct the detailed prompt for code generation
-        full_code_prompt = f"""
-You are an expert trading strategy programmer for the 'Trading Platform'.
-Your goal is to generate Python code based on the user's request.
-The code must use the provided 'Trading Platform Python SDK'.
+        final_prompt_string = f'''
+# You are an expert Python programmer specializing in writing algorithmic trading strategies
+# for the 'Trading Platform'. Your primary goal is to generate a complete, runnable Python
+# strategy script based on the user's request.
 
-User Request: "{code_gen_prompt_details}"
+# User's Strategy Request: "{code_gen_prompt_details}"
 
-Target Language: Python
+# IMPORTANT INSTRUCTIONS AND GUIDELINES:
+# 1.  **SDK Usage:** The generated Python code MUST strictly use the 'Trading Platform Python SDK' functions and classes as defined in the SDK Reference below. Do NOT use any other hypothetical or external trading libraries (e.g., `ibapi`, `ccxt`, `alpaca_trade_api`) unless they are part of a standard Python library import like `math` or `datetime`.
+# 2.  **Strategy Structure:** The main strategy logic MUST be encapsulated within a class that inherits from `sdk.BaseStrategy`.
+# 3.  **Core Methods:** Implement the necessary `sdk.BaseStrategy` lifecycle methods: `__init__`, `on_start`, `on_bar`, `on_fill`, and `on_stop`.
+# 4.  **Imports:** Always include `import sdk` at the top of the script. Import `datetime`, `typing.Dict`, `typing.Any`, `typing.List`, `typing.Optional` as needed for type hints in method signatures.
+# 5.  **Parameters:** Strategy parameters should be accessed from `self.strategy_params` within `__init__` (e.g., `self.my_param = self.strategy_params.get('my_config_param_name', default_value)`).
+# 6.  **Market Data in `on_bar`:** Use the `current_bar_data_bundle` argument provided to `on_bar` for current bar data. Only use `sdk.get_market_data()` in `on_start()` for fetching initial historical data for indicator warm-up if necessary.
+# 7.  **Order Quantity:** For `sdk.submit_order()`, `quantity` is positive for BUY orders and negative for SELL orders.
+# 8.  **Code Only:** Your response should be ONLY the raw Python code for the strategy. Do NOT include any surrounding text, explanations, markdown formatting (like \`\`\`python ... \`\`\`), or any conversational pleasantries.
+# 9.  **Completeness:** Generate a complete, runnable script. This includes the class definition and any necessary helper functions if they are simple and self-contained.
+# 10. **Clarity:** Comment the code clearly to explain the logic.
+# 11. **Error Handling:** For SDK calls like `sdk.get_position()`, check for `None` returns before accessing attributes.
 
-SDK Information:
-{PYTHON_SDK_SNIPPET_FOR_LLM}
+# {PYTHON_SDK_SNIPPET_FOR_LLM}
 
-Please generate a complete, runnable Python script or class structure.
-Ensure all necessary SDK imports are included.
-The main logic should be within a class or functions that the platform can call (e.g., an event handler like `on_bar`).
-Comment your code clearly.
-"""
-        print(f"LLM Interface: Constructed Code Generation Prompt (summary):\nUser Request: {code_gen_prompt_details}\nSDK Snippet Included: Yes")
-        # print(f"Full prompt (for debugging, can be long):\n{full_code_prompt}") # Usually too verbose for logs
+# Generated Python Code:
+# '''
+        llm_contents_for_request = [{'role': 'user', 'parts': [{'text': final_prompt_string}]}] # Gemini expects content format
+        logger.debug("LLM Code Gen Prompt (summary)", extra={"user_request": code_gen_prompt_details})
+    else:
+        if conversation_history:
+            llm_contents_for_request.extend(conversation_history)
+        current_user_message_content = user_message
+        if rag_context:
+            current_user_message_content = f"{rag_context}\n\nUser Question: {user_message}"
+            logger.debug("Augmented user message with RAG context.", extra={"rag_context_snippet": rag_context[:100]})
+        llm_contents_for_request.append({'role': 'user', 'parts': [{'text': current_user_message_content}]})
+        logger.debug(f"LLM Chat Content. History turns: {len(conversation_history) if conversation_history else 0}. Current message starts: '{user_message[:100]}'")
 
-        # Mocked LLM response for code generation
-        mock_generated_code = f"""# Mock generated Python strategy for: {code_gen_prompt_details}
-import sdk
+    if llm_service_config.llm_api_provider == "gemini":
+        if not GEMINI_AVAILABLE: return "Error: Gemini library not installed.", None, "GEMINI_LIB_MISSING"
+        if not llm_service_config.gemini_api_key: return "Error: Gemini API key not configured.", None, "GEMINI_KEY_MISSING"
+        try:
+            genai.configure(api_key=llm_service_config.gemini_api_key)
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            ]
+            model = genai.GenerativeModel(llm_service_config.gemini_model_name)
+            logger.info(f"Sending to Gemini model: {llm_service_config.gemini_model_name}.", extra={"num_content_parts": len(llm_contents_for_request)})
+            response = await model.generate_content_async(llm_contents_for_request, safety_settings=safety_settings)
 
-class UserStrategy:
-    def __init__(self, symbol='AAPL', lookback=20):
-        self.symbol = symbol
-        self.lookback = lookback
-        self.prices = []
-        sdk.log(f"Strategy initialized for {self.symbol} with lookback {self.lookback}")
+            if not response.parts:
+                block_reason_detail = "Unknown"; candidate_safety_issues = []
+                if response.prompt_feedback and response.prompt_feedback.block_reason: block_reason_detail = response.prompt_feedback.block_reason.name
+                if response.candidates:
+                    for candidate in response.candidates:
+                        if hasattr(candidate, 'finish_reason') and candidate.finish_reason and candidate.finish_reason.name == "SAFETY":
+                            for rating in candidate.safety_ratings:
+                                if rating.probability.name not in ["NEGLIGIBLE", "LOW"]: candidate_safety_issues.append(f"{rating.category.name}: {rating.probability.name}")
+                            if candidate_safety_issues: break
+                detailed_safety_msg = "; ".join(candidate_safety_issues) if candidate_safety_issues else block_reason_detail
+                logger.warning(f"Gemini response blocked.", extra={"reason": detailed_safety_msg, "prompt_feedback": str(response.prompt_feedback)})
+                return f"Response blocked by safety settings. Reason: {detailed_safety_msg}", None, "GEMINI_SAFETY_BLOCK"
 
-    def on_bar(self, bar_data):
-        \"\"\"
-        This function is called by the platform for each new bar of data.
-        bar_data is a dict: {{"timestamp": "...", "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...}}
-        \"\"\"
-        sdk.log(f"Processing bar for {self.symbol} at {bar_data['timestamp']}, Close: {bar_data['close']}")
-        self.prices.append(bar_data['close'])
-        if len(self.prices) > self.lookback:
-            self.prices.pop(0)
+            response_text_content = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+            if is_code_generation_request:
+                generated_code = response_text_content.strip()
+                if generated_code.startswith("```python"):
+                    generated_code = generated_code[len("```python"):].lstrip()
+                elif generated_code.startswith("```"):
+                     generated_code = generated_code[len("```"):].lstrip()
+                if generated_code.endswith("```"):
+                    generated_code = generated_code[:-len("```")].rstrip()
+                generated_code = generated_code.strip() # Final strip for any remaining whitespace
+                logger.info(f"Gemini Code Gen Response received.", extra={"code_start": generated_code[:100]})
+                return f"Generated Python code for '{code_gen_prompt_details}'.", generated_code, None
+            else:
+                logger.info(f"Gemini Chat Response received.", extra={"response_start": response_text_content[:100]})
+                return response_text_content, None, None
+        except Exception as e:
+            logger.error(f"Error calling Gemini API.", exc_info=True, extra={"original_error": str(e)})
+            return f"Error connecting to Gemini: {str(e)}", None, "GEMINI_API_ERROR"
 
-        if len(self.prices) < self.lookback:
-            sdk.log("Not enough data yet to compute indicators.")
-            return
-
-        # Example: Simple moving average logic (conceptual for {code_gen_prompt_details})
-        current_ma = sum(self.prices) / len(self.prices)
-        previous_ma = sum(self.prices[:-1]) / len(self.prices[:-1]) if len(self.prices) > 1 else current_ma
-
-        sdk.log(f"Current MA({self.lookback}): {current_ma:.2f}, Previous Close: {bar_data['close']}")
-
-        # {code_gen_prompt_details} might involve comparing price to MA or two MAs
-        if bar_data['close'] > current_ma and self.prices[-2] <= previous_ma: # Example crossover
-            sdk.log(f"BUY signal: Close ({bar_data['close']}) crossed above MA ({current_ma:.2f})")
-            sdk.submit_order(self.symbol, "MARKET", 10)
-        elif bar_data['close'] < current_ma and self.prices[-2] >= previous_ma: # Example crossunder
-            sdk.log(f"SELL signal: Close ({bar_data['close']}) crossed below MA ({current_ma:.2f})")
-            # Assuming we want to sell existing position, check portfolio (concept)
-            # portfolio = sdk.get_portfolio_summary()
-            # if portfolio['positions'].get(self.symbol, {{}}).get('quantity', 0) > 0:
-            #    sdk.submit_order(self.symbol, "MARKET", portfolio['positions'][self.symbol]['quantity'])
-            sdk.submit_order(self.symbol, "MARKET", 10) # Sell 10 for simplicity
-
-# Example of how the platform might run this:
-# strategy = UserStrategy(symbol="MSFT", lookback=10)
-# market_data_stream = sdk.get_market_data("MSFT", lookback_period=100) # Get initial history + stream
-# for bar in market_data_stream:
-#   strategy.on_bar(bar)
-"""
-        response_text = f"Generated Python code sketch for '{code_gen_prompt_details}'. Please review the code."
-        return response_text, mock_generated_code
-
-    # Non-code generation path (same as before)
-    if LLM_API_PROVIDER == "gemini":
-        # Placeholder for Gemini API call
-        # import google.generativeai as genai
-        # genai.configure(api_key=LLM_API_KEY)
-        # model = genai.GenerativeModel('gemini-pro') # Or specific model
-        # try:
-        #     # response = model.generate_content(user_message) # Simplified; might need history, context
-        #     # return response.text
-        # except Exception as e:
-        #     print(f"Error calling Gemini API: {e}")
-        #     return f"Error connecting to Gemini: {e}"
-        print("Gemini API call placeholder. Returning mock response.")
-        return f"[Mocked Gemini Response] You said: '{user_message}'. Live Gemini integration is conceptual here."
-
-    elif LLM_API_PROVIDER == "deepseek":
-        # Placeholder for DeepSeek API call
-        # import httpx # Or requests
-        # headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-        # payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": user_message}]} # Simplified
-        # try:
-        #     async with httpx.AsyncClient() as client:
-        #         api_response = await client.post("https://api.deepseek.com/chat/completions", json=payload, headers=headers)
-        #     api_response.raise_for_status()
-        #     return api_response.json()['choices'][0]['message']['content']
-        # except Exception as e:
-        #     print(f"Error calling DeepSeek API: {e}")
-        #     return f"Error connecting to DeepSeek: {e}"
-        print("DeepSeek API call placeholder. Returning mock response.")
-        return f"[Mocked DeepSeek Response] You said: '{user_message}'. Live DeepSeek integration is conceptual here."
-
-    else: # Default to the original mock for "mock" or unconfigured provider
-        print(f"LLM provider is '{LLM_API_PROVIDER}'. Using standard mock response for general chat.")
-        # Fallback to a simpler mock if not specifically "gemini" or "deepseek"
-        if "hello" in user_message.lower():
-            return "Hello from the 'live' mock LLM!", None
-        return f"Standard mock response to: '{user_message}'", None
-
-
-# --- Conceptual Tool Detection & Execution ---
-# For this PoC, tools are placeholders and detection is very basic.
-# In a real system, this would involve more sophisticated intent recognition or LLM function calling.
-
-# Mock Tool Implementations (conceptual paths, actual files will be created separately)
-# from .tools.chart_data_tool import ChartDataTool # Already imported above
-# from .tools.news_analysis_tool import NewsAnalysisTool # Already imported above
-# from .tools.earnings_analysis_tool import EarningsAnalysisTool # Already imported above
+    elif llm_service_config.llm_api_provider == "mock" or not llm_service_config.llm_api_provider :
+        logger.info("Using MOCK LLM response.")
+        history_context_mock = ""
+        if conversation_history and len(conversation_history) > 0:
+            history_context_mock = f" (User mentioned '{conversation_history[-1]['parts'][0]['text']}' before this current message)"
+        if rag_context: history_context_mock += f" (RAG provided: '{rag_context[:50]}...')"
+        if is_code_generation_request:
+            mock_code = f"# Mock Python strategy for: {code_gen_prompt_details}\n# Context: {history_context_mock}\nimport sdk\n\nclass MockStrategy(sdk.BaseStrategy):\n    def on_bar(self, timestamp, bar_data_bundle):\n        sdk.log(f'MockStrategy {{self.strategy_id}} processing bar for {{timestamp}}')\n        sdk.submit_order('AAPL', 'MARKET', 1)\n"
+            return f"Generated mock Python code for '{code_gen_prompt_details}'.", mock_code, None
+        if "hello" in user_message.lower(): return f"Hello from the mock LLM!{history_context_mock}", None, None
+        return f"Mock LLM response to: '{user_message}'.{history_context_mock}", None, None
+    else:
+        logger.error(f"Unsupported LLM provider configured.", extra={"provider": llm_service_config.llm_api_provider})
+        return f"Error: Unsupported LLM provider.", None, "UNSUPPORTED_PROVIDER"
 
 # Tool instances
-chart_tool = ChartDataTool()
-news_tool = NewsAnalysisTool()
-earnings_tool = EarningsAnalysisTool()
+chart_tool = ChartDataTool(); news_tool = NewsAnalysisTool(); earnings_tool = EarningsAnalysisTool()
+chat_router = APIRouter(prefix="/api/v1/chat", tags=["Chat Endpoints"], dependencies=[Depends(verify_api_key)])
 
-# --- API Endpoint ---
-@app.post("/chat", response_model=LLMResponse)
-async def chat_with_llm(chat_message: ChatMessage = Body(...)):
-    """
-    Receives a user's chat message, potentially uses a tool, and returns an LLM response.
-    """
-    tool_used_name = None
-    tool_response_content = None
-    generated_code_content = None
-    final_response_text = ""
+@chat_router.post("", response_model=LLMResponse)
+async def chat_with_llm_endpoint(chat_message: ChatMessage = Body(...)):
+    tool_used_name = None; tool_response_content = None # This will store summary_text
+    structured_tool_data_content: Optional[Any] = None
+    tool_data_type_content: Optional[str] = None
+    generated_code_content = None; final_response_text = ""; error_msg_llm = None
+    rag_context_str: Optional[str] = None; rag_context_used_flag = False
+
+    session_id_to_use = chat_message.session_id if chat_message.session_id else chat_message.user_id
+    if not session_id_to_use:
+        logger.error("API Error: session_id and user_id are missing."); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="session_id or user_id is required.")
 
     try:
-        print(f"API: Received chat message from user {chat_message.user_id}, session {chat_message.session_id}: '{chat_message.message}'")
+        logger.info("API: Chat request received.", extra={"user_id": chat_message.user_id, "session_id": session_id_to_use, "message_snippet": chat_message.message[:50]})
         user_msg_lower = chat_message.message.lower()
 
-        # Code Generation Mode Detection
-        if user_msg_lower.startswith("/code"):
-            code_request_details = chat_message.message[len("/code"):].strip() # Extract actual request
+        is_code_gen_mode = user_msg_lower.startswith("/code"); code_request_details = ""
+        is_tool_mode = False
+
+        history_manager_instance.add_message(session_id_to_use, "user", chat_message.message)
+        conversation_hist_for_llm = history_manager_instance.get_history(session_id_to_use)[:-1]
+
+        if is_code_gen_mode:
+            code_request_details = chat_message.message[len("/code"):].strip()
             if not code_request_details:
-                final_response_text = "Please provide details for code generation after /code command. E.g., /code generate python strategy for EMA crossover."
+                final_response_text = "Please provide details for code generation after /code command."
+                error_msg_llm = "CODE_GEN_NO_DETAILS"
             else:
-                print(f"API: Code generation requested: '{code_request_details}'")
-                final_response_text, generated_code_content = await get_live_llm_response(
-                    user_message=chat_message.message, # Pass original message for context if LLM uses it
-                    user_id=chat_message.user_id,
-                    session_id=chat_message.session_id,
-                    is_code_generation_request=True,
-                    code_gen_prompt_details=code_request_details
-                )
-        # Tool Detection (Conceptual - same as before, but now code gen is prioritized)
+                logger.info(f"API: Code generation requested.", extra={"details": code_request_details})
+                final_response_text, generated_code_content, error_msg_llm = await get_live_llm_response(
+                    user_message=chat_message.message, user_id=chat_message.user_id,
+                    conversation_history=None, rag_context=None,
+                    is_code_generation_request=True, code_gen_prompt_details=code_request_details)
+
         elif "get chart for" in user_msg_lower:
             symbol_query = user_msg_lower.split("get chart for")[-1].strip().upper()
             tool_used_name = chart_tool.name
-            tool_response_content = chart_tool.execute(symbol=symbol_query if symbol_query else "UNKNOWN_SYMBOL")
+            # Chart tool currently returns a string directly. We'll adapt it slightly.
+            chart_summary_text = chart_tool.execute(symbol=symbol_query if symbol_query else "MSFT") # ChartTool.execute is sync
+            tool_response_content = chart_summary_text
+            structured_tool_data_content = {"info": chart_summary_text} # Wrap string in a basic structure
+            tool_data_type_content = "chart_info_text"
             final_response_text = tool_response_content
-            print(f"API: Tool '{tool_used_name}' triggered. Response: '{tool_response_content}'")
+            is_tool_mode = True
+            logger.info("API: ChartTool executed.", extra={"tool_name": tool_used_name, "response_snippet": final_response_text[:100]})
 
         elif "news about" in user_msg_lower:
             news_query = user_msg_lower.split("news about")[-1].strip()
             tool_used_name = news_tool.name
-            tool_response_content = news_tool.execute(query=news_query if news_query else "general market")
+            tool_execution_result = await news_tool.execute(query=news_query if news_query else "market", limit=3)
+            tool_response_content = tool_execution_result.get("summary_text")
+            structured_tool_data_content = tool_execution_result.get("structured_data")
+            tool_data_type_content = tool_execution_result.get("data_type")
             final_response_text = tool_response_content
-            print(f"API: Tool '{tool_used_name}' triggered. Response: '{tool_response_content}'")
+            is_tool_mode = True
+            logger.info("API: NewsAnalysisTool executed.", extra={"tool_name": tool_used_name, "response_snippet": final_response_text[:100]})
 
         elif "earnings for" in user_msg_lower:
             earnings_query = user_msg_lower.split("earnings for")[-1].strip().upper()
             event_type = "historical" if "historical" in user_msg_lower else "upcoming"
             tool_used_name = earnings_tool.name
-            tool_response_content = earnings_tool.execute(symbol=earnings_query if earnings_query else "UNKNOWN_SYMBOL", event_type=event_type)
+            tool_execution_result = await earnings_tool.execute(symbol=earnings_query if earnings_query else "TSLA", event_type=event_type, limit=4)
+            tool_response_content = tool_execution_result.get("summary_text")
+            structured_tool_data_content = tool_execution_result.get("structured_data")
+            tool_data_type_content = tool_execution_result.get("data_type")
             final_response_text = tool_response_content
-            print(f"API: Tool '{tool_used_name}' triggered. Response: '{tool_response_content}'")
+            is_tool_mode = True
+            logger.info("API: EarningsAnalysisTool executed.", extra={"tool_name": tool_used_name, "response_snippet": final_response_text[:100]})
 
-        else:
-            # If no tool or /code command, proceed to general LLM call
-            print("API: No specific tool or /code command detected. Proceeding to general LLM chat.")
-            final_response_text, _ = await get_live_llm_response( # General chat doesn't expect generated code back directly here
-                user_message=chat_message.message,
-                user_id=chat_message.user_id,
-                session_id=chat_message.session_id,
-                is_code_generation_request=False
-            )
+        else: # General chat, potentially with RAG
+            if retriever_instance and retriever_instance.index and hasattr(retriever_instance.index, 'ntotal') and retriever_instance.index.ntotal > 0:
+                logger.debug(f"API: Performing RAG retrieval for query.", extra={"query": chat_message.message})
+                try:
+                    retrieved_docs = retriever_instance.retrieve_relevant_documents(chat_message.message, top_k=3)
+                    if retrieved_docs and not (len(retrieved_docs)==1 and "unavailable" in retrieved_docs[0].get("content","").lower()):
+                        rag_context_str = retriever_instance.format_documents_for_prompt(retrieved_docs); rag_context_used_flag = True
+                        logger.debug(f"API: RAG context generated.", extra={"context_snippet": rag_context_str[:100]})
+                    else: logger.debug("API: No relevant documents found by RAG or RAG unavailable.")
+                except Exception as e_rag: logger.error(f"API: Error during RAG retrieval.", exc_info=True, extra={"error": str(e_rag)})
+
+            final_response_text, generated_code_content, error_msg_llm = await get_live_llm_response(
+                user_message=chat_message.message, user_id=chat_message.user_id,
+                conversation_history=conversation_hist_for_llm, rag_context=rag_context_str,
+                is_code_generation_request=False)
+            if generated_code_content: logger.warning("General chat returned code, unexpected.")
+
+        if not error_msg_llm and final_response_text and not is_tool_mode:
+            response_to_store = generated_code_content if is_code_gen_mode and generated_code_content else final_response_text
+            if response_to_store: history_manager_instance.add_message(session_id_to_use, "assistant", response_to_store)
 
         response = LLMResponse(
-            llm_service_name=f"{LLM_API_PROVIDER.upper()}_Conceptual" if LLM_API_PROVIDER != "mock" else "MockLLM/PoC_CodeGen_Structure",
-            original_message=chat_message.message,
-            response_text=final_response_text,
+            llm_service_name=f"{llm_service_config.llm_api_provider.upper()}" if llm_service_config.llm_api_provider != "mock" else "MockLLM",
+            original_message=chat_message.message, response_text=final_response_text,
             tool_used=tool_used_name,
-            tool_response=tool_response_content,
-            generated_code=generated_code_content,
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-
-        print(f"API: Sending back response. Text: '{response.response_text[:100]}...' (Tool: {tool_used_name}, Code: {response.generated_code is not None})")
+            tool_response=tool_response_content, # This is the summary_text from the tool
+            structured_tool_data=structured_tool_data_content,
+            tool_data_type=tool_data_type_content,
+            generated_code=generated_code_content, error_message=error_msg_llm,
+            session_id=session_id_to_use, rag_context_used=rag_context_used_flag,
+            timestamp=datetime.datetime.now(datetime.timezone.utc))
+        logger.info("API: Sending response.", extra={
+            "llm_response_snippet": response.response_text[:100],
+            "tool_used": tool_used_name,
+            "tool_data_type": tool_data_type_content,
+            "has_structured_data": structured_tool_data_content is not None,
+            "code_generated": response.generated_code is not None,
+            "error": response.error_message
+            })
         return response
-
     except Exception as e:
-        print(f"API Error: An error occurred during chat processing: {e}")
-        # In a real scenario, distinguish between client errors, LLM API errors, and internal server errors.
-        # For LLM API errors, you might inspect `e` if it's from `response.raise_for_status()`.
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal error occurred. Details: {str(e)}"
-        )
+        logger.error(f"API Error in /chat endpoint.", exc_info=True, extra={"error": str(e)})
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error processing chat.")
+
+app.include_router(chat_router)
+
+@app.get("/health", tags=["Health Check"], summary="Check service health")
+async def health_check():
+    sub_systems = []
+    healthy_overall = True
+    if llm_service_config.llm_api_provider != "mock":
+        key_is_missing = (llm_service_config.llm_api_provider == "gemini" and not llm_service_config.gemini_api_key)
+        if key_is_missing:
+            sub_systems.append({"name": "LLM_Provider_Config", "status": "UNHEALTHY", "detail": f"{llm_service_config.llm_api_provider} API key is missing."})
+            healthy_overall = False
+        else:
+            sub_systems.append({"name": "LLM_Provider_Config", "status": "HEALTHY", "detail": f"Provider: {llm_service_config.llm_api_provider}"})
+    else:
+        sub_systems.append({"name": "LLM_Provider_Config", "status": "HEALTHY", "detail": "Provider: mock"})
+
+    if retriever_instance:
+        if retriever_instance.index and retriever_instance.model and hasattr(retriever_instance.index, 'ntotal') and retriever_instance.index.ntotal > 0 :
+            sub_systems.append({"name": "RAG_Retriever", "status": "HEALTHY", "detail": f"Index loaded with {retriever_instance.index.ntotal} vectors."})
+        elif FAISS_ST_AVAILABLE_RETR : # Libs are there, but index/model issue
+            sub_systems.append({"name": "RAG_Retriever", "status": "UNHEALTHY", "detail": "RAG index or model not loaded/empty. Run build_rag_index.py."})
+            healthy_overall = False
+        else: # Libs missing, RAG effectively disabled
+             sub_systems.append({"name": "RAG_Retriever", "status": "DEGRADED", "detail": "RAG dependencies (FAISS/SentenceTransformers) not available. RAG disabled."})
+             # This might not make the whole service unhealthy if RAG is optional
+    else: # Retriever itself failed to initialize at startup
+        sub_systems.append({"name": "RAG_Retriever", "status": "UNAVAILABLE", "detail": "Retriever component failed to initialize at startup (check logs)."})
+        if FAISS_ST_AVAILABLE_RETR: healthy_overall = False # If libs there, it should have initialized.
+
+    if healthy_overall:
+        return {"status": "HEALTHY", "provider": llm_service_config.llm_api_provider, "components": sub_systems}
+    else:
+        from fastapi.responses import JSONResponse # Local import for this case
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            content={"status": "UNHEALTHY", "provider": llm_service_config.llm_api_provider, "components": sub_systems})
+
 
 @app.get("/")
-async def root():
-    return {"message": "Welcome to the LLM Chatbot Service. Use the /chat endpoint to interact."}
+async def root(): return {"message": "LLM Chatbot Service running. Use /api/v1/chat."}
 
-# To run this FastAPI app:
-# 1. Create a directory `llm_chatbot_service` and place this file as `main.py`.
-# 2. Install FastAPI and Uvicorn: pip install fastapi "uvicorn[standard]"
-# 3. Run Uvicorn: uvicorn llm_chatbot_service.main:app --reload --port 8001
-# (Using port 8001 to distinguish from the other backend service on port 8000 if running simultaneously)
-
-# Example of how to test with curl:
-# curl -X POST "http://localhost:8001/chat" \
-# -H "Content-Type: application/json" \
-# -d '{"user_id": "test_user_123", "message": "Hello chatbot!", "session_id": "sess_abc_123"}'
+# Gunicorn command: gunicorn -w 4 -k uvicorn.workers.UvicornWorker llm_chatbot_service.main:app --bind 0.0.0.0:8001

@@ -198,8 +198,9 @@ class RequestHandler:
         return False
 
     # --- Conceptual Data Request Methods ---
-    def request_and_get_account_summary(self, user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    def request_and_get_account_summary(self, user_id: str, timeout: Optional[int] = None) -> Optional[Dict[str, Any]]:
         logger.info(f"RequestHandler: Requesting account summary for user {user_id}")
+        # If timeout is None, ib_client_wrapper will use its configured default.
         try:
             # The IBClientWrapper method `request_account_summary_sync` handles reqID and event internally
             summary_data = self.ib_client_wrapper.request_account_summary_sync(timeout_seconds=timeout)
@@ -216,8 +217,9 @@ class RequestHandler:
             logger.error(f"RequestHandler: Exception requesting account summary for {user_id}: {e}", exc_info=True)
         return None
 
-    def request_and_get_positions(self, user_id: str, timeout: int = 10) -> Optional[List[Dict[str, Any]]]:
+    def request_and_get_positions(self, user_id: str, timeout: Optional[int] = None) -> Optional[List[Dict[str, Any]]]:
         logger.info(f"RequestHandler: Requesting positions for user {user_id}")
+        # If timeout is None, ib_client_wrapper will use its configured default.
         try:
             positions = self.ib_client_wrapper.request_positions_sync(timeout_seconds=timeout)
             if positions is not None: # Can be an empty list if no positions
@@ -233,8 +235,9 @@ class RequestHandler:
             logger.error(f"RequestHandler: Exception requesting positions for {user_id}: {e}", exc_info=True)
         return None
 
-    def request_and_get_pnl(self, account_id: str, con_id: int = 0, model_code: str = "", timeout: int = 10) -> Optional[Dict[str, Any]]:
+    def request_and_get_pnl(self, account_id: str, con_id: int = 0, model_code: str = "", timeout: Optional[int] = None) -> Optional[Dict[str, Any]]:
         logger.info(f"RequestHandler: Requesting PnL for account {account_id}, con_id {con_id}, model '{model_code}'")
+        # If timeout is None, ib_client_wrapper will use its configured default.
         try:
             pnl_data = self.ib_client_wrapper.request_pnl_sync(account=account_id, model_code=model_code, con_id=con_id, timeout_seconds=timeout)
             if pnl_data:

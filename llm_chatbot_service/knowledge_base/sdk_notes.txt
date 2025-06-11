@@ -1,0 +1,21 @@
+SDK Overview:
+The Trading Platform SDK provides functions to interact with market data and execute trades.
+It is designed to be used within a custom strategy class that inherits from sdk.BaseStrategy.
+
+Key SDK functions available to your strategy:
+- sdk.log(message, level, **extra_fields): For logging messages. Supports structured logging.
+- sdk.get_market_data(symbol, timeframe, start_date, end_date, lookback_rows): Fetches historical market data. In backtests, this reads from CSV files. For current bar data, use the 'current_bar_data_bundle' passed to on_bar.
+- sdk.submit_order(symbol, order_type, quantity, price, tif): Submits orders to the backtesting engine. 'order_type' can be "MARKET" or "LIMIT". 'quantity' is signed (positive for buy, negative for sell). 'price' is for LIMIT orders.
+- sdk.get_portfolio_summary(): Returns a dictionary with overall portfolio state including cash, total value, and a list of current positions with their market values.
+- sdk.get_position(symbol): Returns a dictionary with details for a specific symbol's position, including quantity, average price, cost basis, and current market value.
+
+Strategy Lifecycle:
+Your strategy class should implement:
+- on_start(): Called once at the beginning. Good for fetching initial long-term history or setting up indicators.
+- on_bar(timestamp, current_bar_data_bundle): Called for each new time bar with data for all relevant symbols. This is where most trading decisions are made.
+- on_fill(fill_info): Called after one of your orders is executed. `fill_info` is a dictionary with details of the trade.
+- on_stop(): Called once at the end. Good for cleanup or final logging.
+
+Remember to access strategy parameters passed from your config file via `self.strategy_params.get("your_param_name", default_value)` within your strategy methods.
+The `cde_runner.py` script is responsible for loading your strategy and configuration, and running the backtest loop.
+Ensure any Python package dependencies for your strategy are listed in `strategy_requirements.txt`.

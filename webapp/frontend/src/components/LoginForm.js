@@ -1,37 +1,47 @@
 import React, { useState } from 'react';
+import { notificationService } from '../services/notificationService'; // Import notificationService
 
 function LoginForm({ onLogin }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(''); // Keep local error for inline display if needed
 
   const handleSubmit = async (event) => {
     event.preventDefault();
-    setError(''); // Clear previous errors
+    setError(null); // Clear previous errors
+
+    // FastAPI's OAuth2PasswordRequestForm expects x-www-form-urlencoded
+    const formBody = new URLSearchParams();
+    formBody.append('username', username);
+    formBody.append('password', password);
 
     try {
-      // In a real app, this URL would be configurable
-      const response = await fetch('/auth/token', { // Assuming backend is served on the same domain or proxied
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded', // FastAPI's OAuth2PasswordRequestForm expects form data
-        },
-        body: new URLSearchParams({
-          username: username,
-          password: password,
-        }),
-      });
+        const response = await fetch('/auth/token', { // Adjust URL if needed for dev (e.g., http://localhost:8000/auth/token)
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: formBody.toString(),
+        });
 
-      if (response.ok) {
         const data = await response.json();
-        onLogin(data.access_token); // Pass the token to the parent component
-      } else {
-        const errorData = await response.json();
-        setError(errorData.detail || 'Login failed');
-      }
+
+        if (!response.ok) {
+            throw new Error(data.detail || 'Login failed. Please check your credentials.');
+        }
+
+        if (data.access_token) {
+            notificationService.showSuccess("Login successful!");
+            onLogin(data.access_token);
+        } else {
+            // This case might be redundant if !response.ok already caught it
+            throw new Error('Login failed: No access token received.');
+        }
     } catch (err) {
-      setError('Network error or server is down.');
-      console.error("Login error:", err);
+        const errorMessage = err.message || 'Login failed. Please check your credentials.';
+        setError(errorMessage); // Set local error state for display within the form
+        notificationService.showError(errorMessage); // Show toast notification
+        console.error("Login error:", err);
     }
   };
 
