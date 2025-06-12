@@ -50,3 +50,27 @@ variable "versioning_enabled" {
   type        = bool
   default     = true # Good default for most buckets
 }
+
+variable "enable_rag_data_bucket" {
+  description = "Set to true to create an S3 bucket for RAG data."
+  type        = bool
+  default     = false
+}
+
+variable "rag_data_bucket_name_suffix" {
+  description = "Suffix for the RAG data bucket name. Full name: <prefix>-<suffix>-<env>-<accountid>."
+  type        = string
+  default     = "rag-data"
+}
+
+variable "rag_data_versioning_enabled" {
+  description = "Set to true to enable versioning on the RAG data bucket."
+  type        = bool
+  default     = true
+}
+
+variable "rag_data_force_destroy" {
+  description = "Set to true to allow Terraform to destroy the RAG data bucket even if it contains objects."
+  type        = bool
+  default     = false
+}

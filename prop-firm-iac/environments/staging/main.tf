@@ -47,8 +47,14 @@ module "s3_buckets" {
   enable_logging_bucket     = var.enable_s3_logging_bucket
   enable_cloudtrail_bucket  = var.enable_s3_cloudtrail_bucket
   enable_artifacts_bucket   = var.enable_s3_artifacts_bucket
-  force_destroy_buckets     = true # For staging, can set to true. For prod, should be false.
-  versioning_enabled        = true # Defaulted in module, can be overridden
+  force_destroy_buckets     = true # General flag for artifacts bucket in module
+  versioning_enabled        = true # General flag for versioning in module
+
+  # New RAG bucket parameters
+  enable_rag_data_bucket    = var.enable_s3_rag_data_bucket
+  rag_data_force_destroy    = var.rag_data_force_destroy
+  # rag_data_versioning_enabled is defaulted to true in the module
+  # rag_data_bucket_name_suffix is defaulted in the module
 }
 
 # --- VPC Module ---
@@ -100,5 +106,80 @@ module "monitoring" {
   cloudtrail_log_group_retention_days = var.cloudtrail_log_group_retention_days
   # alarm_sns_topic_arn               = null # Set if you have an SNS topic for alarms
 }
+
+# --- ECS Fargate Cluster Module ---
+module "ecs_cluster" {
+  source = "../../modules/ecs_fargate_cluster"
+
+  environment_name = var.environment_name
+  cluster_name     = var.ecs_cluster_name # Use a variable for cluster name
+  common_tags      = var.common_tags
+}
+
+# --- ALB for Backend Services ---
+module "api_alb" {
+  source = "../../modules/alb_service"
+
+  environment_name    = var.environment_name
+  common_tags         = var.common_tags
+  vpc_id              = module.vpc.vpc_id
+  public_subnet_ids   = module.vpc.public_subnet_ids
+
+  alb_name_prefix     = "api" # e.g., staging-api-alb
+  enable_https        = var.alb_enable_https
+  acm_certificate_arn = var.alb_acm_certificate_arn
+  hosted_zone_name    = var.hosted_zone_name # e.g., "staging.propfirm.example.com" or "propfirm-staging.com"
+  dns_record_name     = var.api_alb_dns_name # e.g., "api.staging.propfirm.example.com"
+  # alb_security_group_ingress_cidrs is defaulted in module to ["0.0.0.0/0"]
+}
+
+# IAM Policy for LLM Chatbot Service (Secrets Manager & S3 RAG Access)
+resource "aws_iam_policy" "llm_chatbot_service_staging_policy" {
+  name        = "${var.environment_name}-llm-chatbot-service-policy"
+  description = "Policy for LLM Chatbot Service in ${var.environment_name} to access Secrets Manager and S3 RAG bucket."
+
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ],
+        Effect   = "Allow",
+        # Restrict to specific secrets or paths. Using path-based restriction:
+        Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${var.llm_secrets_path_prefix}*"
+      },
+      {
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Effect   = "Allow",
+        Resource = [
+          module.s3_buckets.rag_data_bucket_arn,
+          "${module.s3_buckets.rag_data_bucket_arn}/*"  # Access to objects within the bucket
+        ]
+      }
+      # Add s3:PutObject if the service needs to write back to the RAG bucket
+    ]
+  })
+  tags = merge(var.common_tags, { Name = "${var.environment_name}-llm-chatbot-service-policy" })
+}
+
+# --- IAM Role for LLM Chatbot Service ---
+module "llm_chatbot_service_role" {
+  source = "../../modules/iam_service_role"
+
+  environment_name = var.environment_name
+  service_name     = "llm-chatbot" # A short name for the service
+  role_description = "IAM role for LLM Chatbot Service tasks in Staging"
+  common_tags      = var.common_tags
+  attach_policy_arns = [
+    aws_iam_policy.llm_chatbot_service_staging_policy.arn
+    # Add other general policies if needed, e.g., CloudWatch Logs access if not covered by default Task Execution Role from ecs_fargate_cluster
+  ]
+  # assume_role_principals defaults to ["ecs-tasks.amazonaws.com"], which is suitable for ECS tasks.
+}
+
 
 # More modules (compute, database, EKS, etc.) will be called here later.

@@ -26,6 +26,9 @@ terraform_state_lock_table_name  = "prop-firm-terraform-state-lock" # REPLACE (i
 
 # S3 Variables
 s3_bucket_name_prefix = "prop-firm" # Results in prop-firm-access-logs-staging-ACCOUNTID etc.
+enable_s3_rag_data_bucket = true    # Create the RAG data bucket in staging
+# rag_data_force_destroy is defaulted to true in staging variables.tf, can be overridden here if needed:
+# rag_data_force_destroy = false
 
 # Monitoring Variables
 # cloudtrail_cloudwatch_log_group_name is defaulted in variables.tf, override if needed:
@@ -41,3 +44,17 @@ s3_bucket_name_prefix = "prop-firm" # Results in prop-firm-access-logs-staging-A
 #   Project     = "PropFirmPlatform"
 #   CostCenter  = "staging-research"
 # }
+
+# ECS Cluster Variables
+# ecs_cluster_name = "staging-main-cluster" # Optional: Override default name derived by module
+
+# ALB & DNS Variables
+# alb_enable_https        = true # Defaulted in variables.tf, override if needed (e.g. false for pure http internal)
+# alb_acm_certificate_arn = "arn:aws:acm:us-east-1:YOUR_ACCOUNT_ID:certificate/YOUR_CERT_ID" # REPLACE with actual Staging Cert ARN if HTTPS is enabled
+# hosted_zone_name        = "staging.yourdomain.com"  # REPLACE with your actual Route 53 hosted zone for staging
+# api_alb_dns_name        = "api.staging.yourdomain.com" # REPLACE with desired DNS name for the API ALB
+
+# IAM Role & Policy Variables for LLM Chatbot Service
+# llm_secrets_path_prefix = "staging/llm_chatbot_service/" # Defaulted in variables.tf, override if your secret naming convention differs.
+# The rag_s3_bucket_arn for the IAM policy will now be derived from module.s3_buckets.rag_data_bucket_arn
+# No need to set var.rag_s3_bucket_arn here anymore.

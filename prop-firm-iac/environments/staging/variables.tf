@@ -118,6 +118,18 @@ variable "enable_s3_artifacts_bucket" {
   default     = true
 }
 
+variable "enable_s3_rag_data_bucket" {
+  description = "Flag to enable creation of S3 bucket for RAG data."
+  type        = bool
+  default     = true # Enable RAG bucket for staging by default
+}
+
+variable "rag_data_force_destroy" {
+  description = "Force destroy RAG S3 bucket in staging (useful for ephemeral test data)."
+  type        = bool
+  default     = true # OK for staging
+}
+
 # --- Monitoring Module Variables ---
 # cloudtrail_s3_bucket_name will be derived from s3 module output
 variable "enable_cloudtrail_cloudwatch_logs" {
@@ -137,3 +149,40 @@ variable "cloudtrail_log_group_retention_days" {
   type        = number
   default     = 90
 }
+
+# --- ECS Cluster Module Variables ---
+variable "ecs_cluster_name" {
+  description = "Name for the ECS cluster in this environment."
+  type        = string
+  default     = "" # Allows module to derive from environment_name if not set
+}
+
+# --- ALB Service Module Variables ---
+variable "alb_enable_https" {
+  description = "Enable HTTPS for the main API ALB."
+  type        = bool
+  default     = true
+}
+variable "alb_acm_certificate_arn" {
+  description = "ACM certificate ARN for the main API ALB HTTPS listener."
+  type        = string
+  default     = "" # Must be provided if alb_enable_https is true
+}
+variable "hosted_zone_name" {
+  description = "Route 53 hosted zone name for creating DNS records."
+  type        = string
+  default     = "" # e.g., "staging.propfirm.example.com"
+}
+variable "api_alb_dns_name" {
+  description = "DNS name for the API ALB (e.g., api.staging.propfirm.example.com)."
+  type        = string
+  default     = ""
+}
+
+# --- IAM Service Role specific for LLM Chatbot service ---
+variable "llm_secrets_path_prefix" {
+  description = "Path prefix for Secrets Manager secrets for the LLM service (e.g., 'staging/llm_chatbot_service/'). Include trailing slash if it's a path."
+  type        = string
+  default     = "staging/llm_chatbot_service/" # Example
+}
+# rag_s3_bucket_arn is now sourced from module "s3_buckets" output, so no variable here.

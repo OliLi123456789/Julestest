@@ -9,6 +9,7 @@ locals {
   logging_bucket_name    = var.enable_logging_bucket ? "${var.bucket_name_prefix}-access-logs-${local.env_name_sanitized}-${local.acc_id_sanitized}" : null
   cloudtrail_bucket_name = var.enable_cloudtrail_bucket ? "${var.bucket_name_prefix}-cloudtrail-${local.env_name_sanitized}-${local.acc_id_sanitized}" : null
   artifacts_bucket_name  = var.enable_artifacts_bucket ? "${var.bucket_name_prefix}-artifacts-${local.env_name_sanitized}-${local.acc_id_sanitized}" : null
+  rag_data_bucket_name   = var.enable_rag_data_bucket ? "${var.bucket_name_prefix}-${var.rag_data_bucket_name_suffix}-${local.env_name_sanitized}-${local.acc_id_sanitized}" : null
 }
 
 # --- Centralized Server Access Logging Bucket (Optional) ---
@@ -31,6 +32,60 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logging" {
   rule {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
+    }
+  }
+}
+
+# --- RAG Data S3 Bucket (Optional) ---
+resource "aws_s3_bucket" "rag_data" {
+  count         = var.enable_rag_data_bucket ? 1 : 0
+  bucket        = local.rag_data_bucket_name
+  force_destroy = var.rag_data_force_destroy
+
+  tags = merge(var.common_tags, {
+    Name        = local.rag_data_bucket_name
+    Purpose     = "RAG Data (Indexes, Documents)"
+    Environment = var.environment_name
+  })
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "rag_data" {
+  count  = var.enable_rag_data_bucket ? 1 : 0
+  bucket = aws_s3_bucket.rag_data[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "rag_data" {
+  count  = var.enable_rag_data_bucket ? 1 : 0
+  bucket = aws_s3_bucket.rag_data[0].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "rag_data" {
+  count  = var.enable_rag_data_bucket && var.rag_data_versioning_enabled ? 1 : 0
+  bucket = aws_s3_bucket.rag_data[0].id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "rag_data" {
+  count  = var.enable_rag_data_bucket && var.rag_data_versioning_enabled ? 1 : 0 # Only if versioning is on
+  bucket = aws_s3_bucket.rag_data[0].id
+
+  rule {
+    id     = "expire-old-versions-rag" # Unique ID for this rule
+    status = "Enabled"
+    noncurrent_version_expiration {
+      noncurrent_days = 30 # Example: expire non-current versions after 30 days
     }
   }
 }

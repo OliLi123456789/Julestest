@@ -29,3 +29,13 @@ output "artifacts_bucket_arn" {
   description = "The ARN of the S3 bucket for CI/CD artifacts."
   value       = var.enable_artifacts_bucket ? aws_s3_bucket.artifacts[0].arn : null
 }
+
+output "rag_data_bucket_id" {
+  description = "The ID (name) of the S3 bucket for RAG data."
+  value       = var.enable_rag_data_bucket ? aws_s3_bucket.rag_data[0].id : null
+}
+
+output "rag_data_bucket_arn" {
+  description = "The ARN of the S3 bucket for RAG data."
+  value       = var.enable_rag_data_bucket ? aws_s3_bucket.rag_data[0].arn : null
+}
