@@ -1,0 +1,48 @@
+{
+  "family": "llm-chatbot-service-production-family",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "PLACEHOLDER_PROD_ECS_TASK_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "PLACEHOLDER_PROD_LLM_CHATBOT_TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "llm-chatbot-service-container",
+      "image": "PLACEHOLDER_IMAGE_URI",
+      "cpu": 1024,
+      "memory": 2048,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8001,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PYTHONUNBUFFERED", "value": "1" },
+        { "name": "PYTHONDONTWRITEBYTECODE", "value": "1" },
+        { "name": "PORT", "value": "8001" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "LOG_LEVEL", "value": "INFO" },
+        { "name": "LLM_API_PROVIDER", "value": "gemini" },
+        { "name": "LLM_API_KEY_SECRET_NAME_TEMPLATE", "value": "production/llm-chatbot-service/{provider}_api_key" },
+        { "name": "SECRETS_PATH_PREFIX", "value": "production/llm-chatbot-service/"},
+        { "name": "RAG_EMBEDDING_MODEL", "value": "all-MiniLM-L6-v2" },
+        { "name": "RAG_INDEX_PATH", "value": "s3://YOUR_PRODUCTION_RAG_BUCKET_NAME/index.faiss" },
+        { "name": "RAG_DOCUMENTS_PATH", "value": "s3://YOUR_PRODUCTION_RAG_BUCKET_NAME/documents.json" },
+        { "name": "RAG_TOP_K", "value": "3" },
+        { "name": "MAX_HISTORY_TURNS", "value": "10" },
+        { "name": "AWS_REGION", "value": "us-east-1" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/production/llm-chatbot-service",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

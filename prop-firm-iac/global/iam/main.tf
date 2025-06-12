@@ -124,61 +124,97 @@ resource "aws_iam_role" "cicd_github_actions" {
   tags = var.common_tags
 }
 
-# --- IAM Policy for CI/CD Role ---
+# --- IAM Policy for CI/CD Role (Application Deployment Focus) ---
 resource "aws_iam_policy" "cicd_permissions" {
-  name        = "CICDPermissionsPolicy"
-  description = "Policy for CI/CD role to manage infrastructure and deploy applications."
+  name        = "CICDApplicationDeploymentPolicy" # More specific name
+  description = "Policy for CI/CD role to deploy applications (ECR, ECS, S3 for frontend)."
   policy = jsonencode({
-    Version = "2012-10-17",
+    Version   = "2012-10-17",
     Statement = [
-      # Terraform state S3 bucket access
+      // ECR permissions
       {
         Effect = "Allow",
         Action = [
-          "s3:ListBucket",
-          "s3:GetObject",
+          "ecr:GetAuthorizationToken"
+        ],
+        Resource = "*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetRepositoryPolicy",
+          # "ecr:DescribeRepositories", // General describe is separate, more permissive
+          "ecr:ListImages",
+          "ecr:DescribeImages",
+          "ecr:BatchGetImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
+        ],
+        Resource = var.cicd_ecr_repository_arns # Scoped to specific ECR repositories
+      },
+      // Allow describing ECR repositories (general, needed for some CI tools to list/check repos)
+      {
+        Effect   = "Allow",
+        Action   = "ecr:DescribeRepositories",
+        Resource = "*"
+      },
+      // ECS permissions
+      {
+        Effect = "Allow",
+        Action = [
+          "ecs:RegisterTaskDefinition",
+          "ecs:DescribeTaskDefinition"
+        ],
+        Resource = "*" // Task Definition ARNs are not known beforehand, can be scoped by family prefix if desired
+                       // e.g., "arn:aws:ecs:REGION:ACCOUNT_ID:task-definition/my-service-family-prefix-*:*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "ecs:UpdateService",
+          "ecs:DescribeServices",
+          "ecs:ListTasks",
+          "ecs:DescribeTasks"
+        ],
+        Resource = var.cicd_ecs_service_arns # Scoped to specific ECS services
+      },
+      // IAM PassRole permission
+      {
+        Effect = "Allow",
+        Action = "iam:PassRole",
+        Resource = var.cicd_iam_passrole_arns, # Scoped to specific IAM roles that tasks can assume
+        Condition = {
+          "StringEquals" = {
+            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+          }
+        }
+      },
+      // S3 permissions for frontend deployment (if applicable)
+      {
+        Sid    = "S3FrontendDeployment",
+        Effect = "Allow",
+        Action = [
           "s3:PutObject",
-          "s3:DeleteObject"
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:DeleteObject",
+          "s3:GetBucketLocation"
+          // "s3:PutObjectAcl" // If objects need to be public-read
         ],
-        Resource = [
-          "arn:aws:s3:::${var.terraform_state_bucket_name}",
-          "arn:aws:s3:::${var.terraform_state_bucket_name}/*"
-        ]
+        Resource = var.cicd_frontend_s3_bucket_arns # List of bucket ARN and bucket ARN/*
       },
-      # Terraform state DynamoDB lock table access
+      // CloudFront invalidation (if applicable)
       {
+        Sid    = "CloudFrontInvalidation",
         Effect = "Allow",
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:DeleteItem"
-        ],
-        Resource = "arn:aws:dynamodb:${var.aws_region}:${var.aws_account_id}:table/${var.terraform_state_lock_table_name}"
-      },
-      # Broad permissions for Terraform to manage resources (scope down in production)
-      {
-        Effect = "Allow",
-        Action = [
-          "ec2:*", "rds:*", "eks:*", "ecs:*", "s3:*", "elasticloadbalancing:*",
-          "autoscaling:*", "cloudwatch:*", "logs:*",
-          "iam:PassRole", "iam:GetRole", "iam:CreateRole", "iam:DeleteRole",
-          "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
-          "secretsmanager:GetSecretValue", "kms:Decrypt"
-          # Add other service permissions as needed by Terraform
-        ],
-        Resource = "*" # WARNING: Highly permissive. Scope down in a real setup.
-      },
-      # ECR permissions to push/pull Docker images
-      {
-        Effect = "Allow",
-        Action = [
-            "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer",
-            "ecr:GetRepositoryPolicy", "ecr:DescribeRepositories", "ecr:ListImages", "ecr:DescribeImages",
-            "ecr:BatchGetImage", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
-            "ecr:CompleteLayerUpload", "ecr:PutImage"
-        ],
-        Resource = "*" # Can be scoped to specific ECR repositories
+        Action = "cloudfront:CreateInvalidation",
+        Resource = var.cicd_cloudfront_distribution_arns
       }
+      // Terraform state S3 & DynamoDB access has been REMOVED from this policy.
     ]
   })
   tags = var.common_tags
@@ -189,52 +225,14 @@ resource "aws_iam_role_policy_attachment" "cicd_attach_permissions" {
   policy_arn = aws_iam_policy.cicd_permissions.arn
 }
 
-data "aws_iam_policy_document" "self_manage_oidc_provider" {
-  # Policy allowing the CI/CD role to manage the OIDC provider itself if needed
-  # This is optional and depends on how the OIDC provider is managed.
-  # If OIDC provider is managed manually or by another process, this is not needed.
-  statement {
-    actions = [
-      "iam:CreateOpenIDConnectProvider",
-      "iam:DeleteOpenIDConnectProvider",
-      "iam:UpdateOpenIDConnectProviderThumbprint",
-      "iam:GetOpenIDConnectProvider",
-      "iam:ListOpenIDConnectProviders",
-      "iam:TagOpenIDConnectProvider", # If using tags on the OIDC provider
-      "iam:UntagOpenIDConnectProvider"
-    ]
-    resources = ["arn:aws:iam::${var.aws_account_id}:oidc-provider/*"] # Broad, but necessary for creation
-  }
-}
-
-resource "aws_iam_policy" "self_manage_oidc_provider_policy" {
-  name        = "SelfManageOIDCProviderPolicy"
-  description = "Allows management of IAM OIDC providers. Attach to a role that sets up initial OIDC."
-  policy      = data.aws_iam_policy_document.self_manage_oidc_provider.json
-  tags        = var.common_tags
-}
-
-# It's better to attach this policy to a more privileged role used for initial setup,
-# or manage the OIDC provider manually/separately.
-# For this exercise, we'll assume the CI/CD role might need to ensure it exists.
-# However, creating a global resource like an OIDC provider in a reusable module can be tricky.
-# A data source to check for existing provider is safer.
-
-data "aws_iam_openid_connect_provider" "github_oidc_existing" {
-  # Attempt to fetch an existing OIDC provider for GitHub Actions.
-  # This avoids trying to create it if it already exists, which would cause an error.
-  url = "https://token.actions.githubusercontent.com"
-}
-
+# WARNING: The OIDC provider is a global, one-time setup per AWS account.
+# This resource definition will cause an error if the provider already exists.
+# It's recommended to create this manually once, or manage it via a separate, dedicated
+# Terraform configuration for foundational resources. Ensure the thumbprint is current.
+# For dynamic thumbprint fetching, consider using the 'tls' provider as commented below.
+# data "tls_certificate" "github_oidc" { url = "https://token.actions.githubusercontent.com" }
+# thumbprint_list = [data.tls_certificate.github_oidc.certificates[0].sha1_fingerprint]
 resource "aws_iam_openid_connect_provider" "github_oidc_provider" {
-  # Create the OIDC provider only if it doesn't exist.
-  # This requires a mechanism to check for existence, which `data` source does.
-  # A more robust way is to use `count` based on whether `data.aws_iam_openid_connect_provider.github_oidc_existing.arn` is null or empty.
-  # However, direct null checks on data source attributes are not straightforward.
-  # For simplicity, this will attempt to create it. If it fails because it exists,
-  # subsequent runs might succeed if the data source then picks it up, or it needs manual import/separate management.
-  # A common pattern is to manage this OIDC provider as a one-time setup outside of frequently run modules.
-
   # This resource is defined here to ensure the OIDC trust relationship for the CI/CD role can be established.
   # Ideally, manage this globally ONCE per AWS account.
   url = "https://token.actions.githubusercontent.com"

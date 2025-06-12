@@ -31,9 +31,29 @@ module "global_iam" {
   aws_account_id                = data.aws_caller_identity.current.account_id
   ci_cd_github_org_repo         = var.ci_cd_github_org_repo
   common_tags                   = var.common_tags
-  terraform_state_bucket_name   = var.terraform_state_bucket_name # Pass the specific name
-  terraform_state_lock_table_name = var.terraform_state_lock_table_name # Pass the specific name
-  aws_region                    = var.aws_region # For constructing ARNs if needed
+  terraform_state_bucket_name   = var.terraform_state_bucket_name
+  terraform_state_lock_table_name = var.terraform_state_lock_table_name
+  aws_region                    = var.aws_region
+
+  # CI/CD Policy Scoping Variables
+  cicd_ecr_repository_arns = [
+    module.llm_chatbot_ecr_repo.repository_arn,
+    # Add other app ECR repo ARNs here as they are created, e.g.:
+    # module.webapp_backend_ecr_repo.repository_arn
+  ]
+  # For ECS services, initially grant broader permission to update any service in the cluster.
+  # This can be refined if specific service ARNs are known or managed differently.
+  cicd_ecs_service_arns = [
+    "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:service/${module.ecs_cluster.ecs_cluster_name}/*",
+  ]
+  cicd_iam_passrole_arns = [
+    module.llm_chatbot_service_role.role_arn, # Role for LLM service tasks
+    module.ecs_cluster.ecs_task_execution_role_arn, # Default task execution role created with ECS cluster
+    # Add other specific ECS Task Role ARNs here as they are created
+  ]
+  # Assuming no frontend S3 bucket or CloudFront distributions are managed by this specific staging config for now
+  cicd_frontend_s3_bucket_arns      = []
+  cicd_cloudfront_distribution_arns = []
 }
 
 # --- S3 Buckets Module ---
@@ -133,6 +153,17 @@ module "api_alb" {
   # alb_security_group_ingress_cidrs is defaulted in module to ["0.0.0.0/0"]
 }
 
+# --- ECR Repository for LLM Chatbot Service ---
+module "llm_chatbot_ecr_repo" {
+  source = "../../modules/ecr_repository"
+
+  repository_name = "${var.environment_name}-llm-chatbot-service" # e.g., staging-llm-chatbot-service
+  common_tags     = var.common_tags
+  # image_tag_mutability and enable_scan_on_push use module defaults (IMMUTABLE, true)
+  # force_delete uses module default (false), which is acceptable for staging to prevent accidental deletion.
+  # If staging requires frequent clean-up and recreation, this could be set to true via a staging-specific variable.
+}
+
 # IAM Policy for LLM Chatbot Service (Secrets Manager & S3 RAG Access)
 resource "aws_iam_policy" "llm_chatbot_service_staging_policy" {
   name        = "${var.environment_name}-llm-chatbot-service-policy"
@@ -179,6 +210,36 @@ module "llm_chatbot_service_role" {
     # Add other general policies if needed, e.g., CloudWatch Logs access if not covered by default Task Execution Role from ecs_fargate_cluster
   ]
   # assume_role_principals defaults to ["ecs-tasks.amazonaws.com"], which is suitable for ECS tasks.
+}
+
+# --- App Monitoring for LLM Chatbot Service ---
+module "llm_chatbot_monitoring" {
+  source = "../../modules/app_monitoring"
+
+  environment_name = var.environment_name
+  service_name     = "llm-chatbot" # Logical service name for tagging/naming log group
+  common_tags      = var.common_tags
+
+  log_group_name       = "/ecs/${var.environment_name}/llm-chatbot-service" # Example specific name, ensure it's unique
+  log_retention_days   = var.app_log_retention_days
+
+  alarm_sns_topic_arn  = var.alarm_sns_topic_arn
+
+  # ALB Alarms
+  enable_alb_5xx_alarm          = var.alb_enable_https # Typically enable ALB alarms if HTTPS (and thus ALB) is enabled
+  alb_load_balancer_arn_suffix  = module.api_alb.alb_arn_suffix
+  alb_target_group_arn_suffix = module.api_alb.default_target_group_arn_suffix # Assuming default TG is used by this service for now
+
+  # ECS Alarms
+  enable_ecs_service_cpu_alarm    = true # Explicitly enable or make these configurable per service
+  enable_ecs_service_memory_alarm = true
+  ecs_cluster_name                = module.ecs_cluster.ecs_cluster_name
+  ecs_service_name_for_alarms     = var.llm_chatbot_ecs_service_name
+
+  # Thresholds can be overridden here if needed, else module defaults used.
+  # cpu_alarm_threshold_percent = 75
+  # memory_alarm_threshold_percent = 75
+  # error_rate_alarm_threshold_count = 10 # Count of 5XX errors in 5min to trigger alarm
 }
 
 

@@ -186,3 +186,22 @@ variable "llm_secrets_path_prefix" {
   default     = "staging/llm_chatbot_service/" # Example
 }
 # rag_s3_bucket_arn is now sourced from module "s3_buckets" output, so no variable here.
+
+# --- App Monitoring Module Variables (for LLM Chatbot Service) ---
+variable "app_log_retention_days" {
+  description = "Number of days to retain application logs (e.g., for llm-chatbot-service)."
+  type        = number
+  default     = 30
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "ARN of the SNS topic to send CloudWatch alarms to."
+  type        = string
+  default     = "" # Must be set in tfvars for alarms to be effective
+}
+
+variable "llm_chatbot_ecs_service_name" {
+  description = "Actual deployed ECS service name for the LLM Chatbot service, used for ECS-specific alarms."
+  type        = string
+  default     = "llm-chatbot-service-staging" # Example, ensure this matches the actual deployed service name
+}

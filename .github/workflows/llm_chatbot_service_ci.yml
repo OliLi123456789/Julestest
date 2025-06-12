@@ -1,0 +1,370 @@
+name: LLM Chatbot Service CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main # For 'latest' image and triggering prod deploy
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+' # For versioned releases
+    paths:
+      - 'llm_chatbot_service/**'
+      - '.github/workflows/llm_chatbot_service_ci.yml'
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - 'llm_chatbot_service/**'
+      - '.github/workflows/llm_chatbot_service_ci.yml'
+
+env:
+  PYTHON_VERSION: '3.10'
+  AWS_REGION: 'us-east-1' # REPLACE with your target AWS region, or make it a secret/input
+  # ECR_REPOSITORY_LLM_CHATBOT should be just the repository name, e.g., "staging-llm-chatbot-service"
+  # It will be stored as a GitHub Secret.
+
+permissions: # Needed for OIDC
+  id-token: write
+  contents: read
+
+jobs:
+  lint:
+    name: Lint Python Code
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./llm_chatbot_service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install linting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black
+
+      - name: Run Black (Format Check)
+        run: black --check .
+
+      - name: Run Flake8
+        run: flake8 .
+
+  unit_test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    defaults:
+      run:
+        working-directory: ./llm_chatbot_service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Ensure test dependencies like pytest, pytest-asyncio are in requirements.txt
+
+      - name: Run Pytest
+        run: pytest # Pytest will discover tests in the 'tests' subdirectory
+
+  build_scan_and_push_image:
+    name: Build, Scan, and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: unit_test
+    # This job now runs for develop, main, and version tags on push events
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    outputs:
+      image_sha_tag: ${{ steps.image_tags.outputs.image_sha_tag }}
+      image_context_tag: ${{ steps.image_tags.outputs.image_context_tag }} # Changed from image_latest_tag for clarity
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for CI/CD Role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN_LLM_CHATBOT }} # GitHub Secret for the IAM Role ARN
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Define Image Tags
+        id: image_tags
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          # ECR_REPOSITORY_NAME should be dynamic based on env or a single repo for all.
+          # Assuming secrets.ECR_REPOSITORY_LLM_CHATBOT holds the *base name* like 'llm-chatbot-service'
+          # and the environment prefix ('staging-' or 'prod-') is added here or is part of the secret.
+          # For this workflow, we'll assume ECR_REPOSITORY_LLM_CHATBOT is set to the env-specific name like 'staging-llm-chatbot-service' or 'prod-llm-chatbot-service'
+          # If using one repo, logic to derive ECR_REPOSITORY_NAME_FOR_TAGS (e.g. staging-llm-chatbot-service) from secrets would be needed.
+          # Let's assume secrets.ECR_REPOSITORY_LLM_CHATBOT already contains the env-specific name for simplicity of this script.
+          ECR_REPOSITORY_NAME=${{ secrets.ECR_REPOSITORY_LLM_CHATBOT }}
+
+          IMAGE_SHA_TAG_BASE="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}"
+          IMAGE_SHA_TAG=""
+          IMAGE_CONTEXT_TAG="" # This will be develop-latest, latest, or vX.Y.Z
+
+          if [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            IMAGE_SHA_TAG="${IMAGE_SHA_TAG_BASE}:develop-${{ github.sha }}"
+            IMAGE_CONTEXT_TAG="${IMAGE_SHA_TAG_BASE}:develop-latest"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            IMAGE_SHA_TAG="${IMAGE_SHA_TAG_BASE}:main-${{ github.sha }}"
+            IMAGE_CONTEXT_TAG="${IMAGE_SHA_TAG_BASE}:latest" # Main pushes 'latest'
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION_TAG=$(echo "${{ github.ref }}" | sed 's|refs/tags/||') # e.g., v1.0.0
+            IMAGE_SHA_TAG="${IMAGE_SHA_TAG_BASE}:${VERSION_TAG}-${{ github.sha }}"
+            IMAGE_CONTEXT_TAG="${IMAGE_SHA_TAG_BASE}:${VERSION_TAG}"
+          else
+            echo "Branch or tag not configured for ECR push. This job should not have run."
+            exit 1 # Should be caught by job's 'if' condition, but as a safeguard
+          fi
+
+          echo "image_sha_tag=${IMAGE_SHA_TAG}" >> $GITHUB_OUTPUT
+          echo "image_context_tag=${IMAGE_CONTEXT_TAG}" >> $GITHUB_OUTPUT
+          echo "Pushing Image SHA Tag: ${IMAGE_SHA_TAG}"
+          echo "Pushing Image Context Tag: ${IMAGE_CONTEXT_TAG}"
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./llm_chatbot_service # Path to Dockerfile directory
+          file: ./llm_chatbot_service/Dockerfile
+          push: false # Build locally first for scanning
+          tags: ${{ steps.image_tags.outputs.image_sha_tag }}
+          load: true # Load image into docker so trivy can scan it by tag
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image_tags.outputs.image_sha_tag }}
+          format: 'table'
+          exit-code: '1' # Fail on vulnerabilities
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Docker image to ECR
+        # This step runs only if Trivy scan passed (job didn't exit)
+        run: |
+          docker push ${{ steps.image_tags.outputs.image_sha_tag }}
+          if [[ -n "${{ steps.image_tags.outputs.image_context_tag }}" ]]; then
+            docker tag ${{ steps.image_tags.outputs.image_sha_tag }} ${{ steps.image_tags.outputs.image_context_tag }}
+            docker push ${{ steps.image_tags.outputs.image_context_tag }}
+            echo "Also pushed context tag: ${{ steps.image_tags.outputs.image_context_tag }}"
+          fi
+
+  deploy_to_staging:
+    name: Deploy to Staging Environment
+    runs-on: ubuntu-latest
+    needs: build_scan_and_push_image
+    # Only run on pushes to develop branch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+
+    environment:
+      name: staging
+      # url: ${{ secrets.STAGING_APP_URL }} # Optional: URL for the deployed staging app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for CI/CD Role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN_LLM_CHATBOT }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Define Task Definition Family and Container Name
+        id: ecs_vars
+        run: |
+          TASK_DEF_FAMILY="llm-chatbot-service-staging-family"
+          CONTAINER_NAME="llm-chatbot-service-container"
+          echo "task_definition_family=${TASK_DEF_FAMILY}" >> $GITHUB_OUTPUT
+          echo "container_name=${CONTAINER_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Download Task Definition Template
+        run: |
+          cp ./llm_chatbot_service/ecs/staging-task-def.json task-def-template.json
+          echo "Using task definition template from repo: llm_chatbot_service/ecs/staging-task-def.json"
+
+      - name: Fill in Task Definition Template
+        id: task_def_updated
+        env:
+          IMAGE_URI: ${{ needs.build_scan_and_push_image.outputs.image_sha_tag }}
+          ECS_TASK_EXECUTION_ROLE_ARN: ${{ secrets.STAGING_ECS_TASK_EXECUTION_ROLE_ARN }}
+          LLM_CHATBOT_TASK_ROLE_ARN: ${{ secrets.STAGING_LLM_CHATBOT_TASK_ROLE_ARN }}
+          STAGING_RAG_S3_BUCKET_NAME: ${{ secrets.STAGING_RAG_S3_BUCKET_NAME }}
+          # Construct log group name based on convention or use a secret if it's more dynamic/unpredictable
+          AWS_LOG_GROUP_NAME: "/ecs/${{ secrets.STAGING_ENVIRONMENT_NAME || 'staging' }}/llm-chatbot-service"
+          AWS_REGION_ENV: ${{ env.AWS_REGION }}
+        run: |
+          echo "Updating task definition with Image URI: $IMAGE_URI"
+          # Using sed for placeholder replacement. Ensure placeholders are unique and simple.
+          # For complex JSON manipulation, jq or a dedicated action is more robust.
+          # Example: sed -i 's|PLACEHOLDER_TEXT|'"$ACTUAL_VALUE"'|g' task-def-template.json
+          # Note: -i for in-place edit might not be desired if template is reused; redirect to new file.
+
+          # Create a temporary file for the updated task definition
+          TEMP_TASK_DEF_FILE="task-def-staging-updated-$(date +%s).json"
+
+          # Perform replacements
+          sed -e "s|PLACEHOLDER_IMAGE_URI|${IMAGE_URI}|g" \
+              -e "s|PLACEHOLDER_ECS_TASK_EXECUTION_ROLE_ARN|${ECS_TASK_EXECUTION_ROLE_ARN}|g" \
+              -e "s|PLACEHOLDER_LLM_CHATBOT_SERVICE_STAGING_TASK_ROLE_ARN|${LLM_CHATBOT_TASK_ROLE_ARN}|g" \
+              -e "s|s3://YOUR_STAGING_RAG_BUCKET_NAME/index.faiss|s3://${STAGING_RAG_S3_BUCKET_NAME}/index.faiss|g" \
+              -e "s|s3://YOUR_STAGING_RAG_BUCKET_NAME/documents.json|s3://${STAGING_RAG_S3_BUCKET_NAME}/documents.json|g" \
+              -e "s|/ecs/staging/llm-chatbot-service|${AWS_LOG_GROUP_NAME}|g" \
+              -e "s|\"awslogs-region\": \"us-east-1\"|\"awslogs-region\": \"${AWS_REGION_ENV}\"|g" \
+              task-def-template.json > ${TEMP_TASK_DEF_FILE}
+
+          echo "task_def_path=${TEMP_TASK_DEF_FILE}" >> $GITHUB_OUTPUT
+          echo "Updated task definition content:"
+          cat ${TEMP_TASK_DEF_FILE}
+
+
+      - name: Register New ECS Task Definition Revision
+        id: register-task-def
+        run: |
+          # Before this step, ensure jq is installed if using it for parsing output.
+          # sudo apt-get update && sudo apt-get install -y jq
+          aws ecs register-task-definition --cli-input-json file://${{ steps.task_def_updated.outputs.task_def_path }} > register_output.json
+          TASK_DEFINITION_ARN=$(cat register_output.json | jq -r .taskDefinition.taskDefinitionArn)
+          echo "task_definition_arn=${TASK_DEFINITION_ARN}" >> $GITHUB_OUTPUT
+          echo "Registered new task definition: ${TASK_DEFINITION_ARN}"
+          if [ -z "${TASK_DEFINITION_ARN}" ] || [ "${TASK_DEFINITION_ARN}" == "null" ]; then
+            echo "Failed to register task definition or parse ARN."
+            cat register_output.json # Print full output for debugging
+            exit 1
+          fi
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.STAGING_ECS_CLUSTER_NAME }} \
+            --service ${{ secrets.STAGING_LLM_CHATBOT_ECS_SERVICE_NAME }} \
+            --task-definition ${{ steps.register-task-def.outputs.task_definition_arn }} \
+            --force-new-deployment
+          echo "ECS service update initiated for ${{ secrets.STAGING_LLM_CHATBOT_ECS_SERVICE_NAME }} with task definition ${{ steps.register-task-def.outputs.task_definition_arn }}"
+
+      # Optional: Add step to wait for deployment to complete and run smoke tests
+      # - name: Wait for deployment to stabilize
+      #   run: aws ecs wait services-stable --cluster ${{ secrets.STAGING_ECS_CLUSTER_NAME }} --services ${{ secrets.STAGING_LLM_CHATBOT_ECS_SERVICE_NAME }}
+      # - name: Basic Smoke Test
+      #   run: |
+      #     # curl health check endpoint of the service via its ALB
+      #     echo "Smoke test placeholder"
+
+  deploy_to_production:
+    name: Deploy to Production Environment
+    runs-on: ubuntu-latest
+    needs: build_scan_and_push_image # Depends on successful build and push
+    # Run only on pushes to main or version tags
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+
+    environment:
+      name: production # This environment MUST be configured with a manual approval requirement in GitHub settings
+      url: ${{ secrets.PRODUCTION_APP_URL }} # Optional: URL for the deployed production app
+
+    steps:
+      - name: Checkout code # Only needed if task definition is in repo and not dynamically fetched/updated
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for CI/CD Role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN_LLM_CHATBOT }} # Same role as staging for now
+          aws-region: ${{ env.AWS_REGION }} # Or use secrets.PROD_AWS_REGION if different
+
+      - name: Define Task Definition Family and Container Name for Production
+        id: ecs_vars_prod
+        run: |
+          TASK_DEF_FAMILY="llm-chatbot-service-production-family"
+          CONTAINER_NAME="llm-chatbot-service-container"
+          echo "task_definition_family=${TASK_DEF_FAMILY}" >> $GITHUB_OUTPUT
+          echo "container_name=${CONTAINER_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Determine Image URI for Production
+        id: prod_image
+        run: |
+          IMAGE_TO_DEPLOY=""
+          # needs.build_scan_and_push_image.outputs.image_context_tag will be '...:latest' for main, or '...:vX.Y.Z' for tags
+          IMAGE_TO_DEPLOY="${{ needs.build_scan_and_push_image.outputs.image_context_tag }}"
+          if [ -z "$IMAGE_TO_DEPLOY" ]; then
+            echo "Error: IMAGE_CONTEXT_TAG from build job is empty. This should not happen for main/tag pushes."
+            exit 1
+          fi
+          echo "image_uri=${IMAGE_TO_DEPLOY}" >> $GITHUB_OUTPUT
+          echo "Deploying image: ${IMAGE_TO_DEPLOY} to production"
+
+      - name: Download Production Task Definition Template
+        run: |
+          cp ./llm_chatbot_service/ecs/production-task-def.json task-def-prod-template.json
+          echo "Using task definition template from repo: llm_chatbot_service/ecs/production-task-def.json"
+
+      - name: Fill in Production Task Definition Template
+        id: task_def_prod_updated
+        env:
+          IMAGE_URI: ${{ steps.prod_image.outputs.image_uri }}
+          PROD_ECS_TASK_EXECUTION_ROLE_ARN: ${{ secrets.PROD_ECS_TASK_EXECUTION_ROLE_ARN }}
+          PROD_LLM_CHATBOT_TASK_ROLE_ARN: ${{ secrets.PROD_LLM_CHATBOT_TASK_ROLE_ARN }}
+          PROD_RAG_S3_BUCKET_NAME: ${{ secrets.PROD_RAG_S3_BUCKET_NAME }}
+          PROD_LOG_GROUP_NAME: "/ecs/${{ secrets.PROD_ENVIRONMENT_NAME || 'production' }}/llm-chatbot-service"
+          AWS_REGION_ENV: ${{ env.AWS_REGION }} # Or specific prod region from secrets (e.g. secrets.PROD_AWS_REGION)
+        run: |
+          echo "Updating production task definition with Image URI: $IMAGE_URI"
+          TEMP_TASK_DEF_FILE_PROD="task-def-prod-updated-$(date +%s).json"
+
+          sed -e "s|PLACEHOLDER_IMAGE_URI|${IMAGE_URI}|g" \
+              -e "s|PLACEHOLDER_PROD_ECS_TASK_EXECUTION_ROLE_ARN|${PROD_ECS_TASK_EXECUTION_ROLE_ARN}|g" \
+              -e "s|PLACEHOLDER_PROD_LLM_CHATBOT_TASK_ROLE_ARN|${PROD_LLM_CHATBOT_TASK_ROLE_ARN}|g" \
+              -e "s|s3://YOUR_PRODUCTION_RAG_BUCKET_NAME/index.faiss|s3://${PROD_RAG_S3_BUCKET_NAME}/index.faiss|g" \
+              -e "s|s3://YOUR_PRODUCTION_RAG_BUCKET_NAME/documents.json|s3://${PROD_RAG_S3_BUCKET_NAME}/documents.json|g" \
+              -e "s|/ecs/production/llm-chatbot-service|${PROD_LOG_GROUP_NAME}|g" \
+              -e "s|\"awslogs-region\": \"us-east-1\"|\"awslogs-region\": \"${AWS_REGION_ENV}\"|g" \
+              task-def-prod-template.json > ${TEMP_TASK_DEF_FILE_PROD}
+
+          echo "task_def_path=${TEMP_TASK_DEF_FILE_PROD}" >> $GITHUB_OUTPUT
+          echo "Updated production task definition content:"
+          cat ${TEMP_TASK_DEF_FILE_PROD}
+
+      - name: Register New ECS Task Definition Revision for Production
+        id: register-task-def-prod
+        run: |
+          aws ecs register-task-definition --cli-input-json file://${{ steps.task_def_prod_updated.outputs.task_def_path }} > output_prod.json
+          TASK_DEFINITION_ARN_PROD=$(cat output_prod.json | jq -r .taskDefinition.taskDefinitionArn)
+          echo "task_definition_arn_prod=${TASK_DEFINITION_ARN_PROD}" >> $GITHUB_OUTPUT
+          echo "Registered new task definition for Production: ${TASK_DEFINITION_ARN_PROD}"
+          if [ -z "${TASK_DEFINITION_ARN_PROD}" ] || [ "${TASK_DEFINITION_ARN_PROD}" == "null" ]; then
+            echo "Failed to register task definition for production or parse ARN."
+            cat output_prod.json
+            exit 1
+          fi
+
+      - name: Update ECS Service in Production
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.PROD_ECS_CLUSTER_NAME }} \
+            --service ${{ secrets.PROD_LLM_CHATBOT_ECS_SERVICE_NAME }} \
+            --task-definition ${{ steps.register-task-def-prod.outputs.task_definition_arn_prod }} \
+            --force-new-deployment
+          echo "Production ECS service update initiated for ${{ secrets.PROD_LLM_CHATBOT_ECS_SERVICE_NAME }}"

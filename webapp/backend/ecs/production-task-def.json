@@ -1,0 +1,42 @@
+{
+  "family": "webapp-backend-production-family",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "PLACEHOLDER_PROD_ECS_TASK_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "PLACEHOLDER_PROD_WEBAPP_BACKEND_TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "webapp-backend-container",
+      "image": "PLACEHOLDER_IMAGE_URI",
+      "cpu": 512,
+      "memory": 1024,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PYTHONUNBUFFERED", "value": "1" },
+        { "name": "PYTHONDONTWRITEBYTECODE", "value": "1" },
+        { "name": "PORT", "value": "8000" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "LOG_LEVEL", "value": "WARNING" },
+        { "name": "LLM_CHATBOT_SERVICE_URL", "value": "http://REPLACE_WITH_PRODUCTION_LLM_CHATBOT_ALB_DNS_OR_SERVICE_DISCOVERY_NAME:8001" },
+        { "name": "DATABASE_SECRET_ARN", "value": "arn:aws:secretsmanager:REPLACE_AWS_REGION:REPLACE_AWS_ACCOUNT_ID:secret:production/webapp-backend/database_credentials-XXXXXX" }
+        // Add other production-specific env vars
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/production/webapp-backend",
+          "awslogs-region": "REPLACE_AWS_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

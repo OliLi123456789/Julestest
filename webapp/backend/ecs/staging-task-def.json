@@ -1,0 +1,42 @@
+{
+  "family": "webapp-backend-staging-family",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "PLACEHOLDER_STAGING_ECS_TASK_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "PLACEHOLDER_STAGING_WEBAPP_BACKEND_TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "webapp-backend-container",
+      "image": "PLACEHOLDER_IMAGE_URI",
+      "cpu": 256,
+      "memory": 512,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PYTHONUNBUFFERED", "value": "1" },
+        { "name": "PYTHONDONTWRITEBYTECODE", "value": "1" },
+        { "name": "PORT", "value": "8000" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "LOG_LEVEL", "value": "INFO" },
+        { "name": "LLM_CHATBOT_SERVICE_URL", "value": "http://REPLACE_WITH_STAGING_LLM_CHATBOT_ALB_DNS_OR_SERVICE_DISCOVERY_NAME:8001" },
+        { "name": "DATABASE_SECRET_ARN", "value": "arn:aws:secretsmanager:REPLACE_AWS_REGION:REPLACE_AWS_ACCOUNT_ID:secret:staging/webapp-backend/database_credentials-XXXXXX" }
+        // Add other necessary env vars, e.g., for CORS origins, other service URLs
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/staging/webapp-backend",
+          "awslogs-region": "REPLACE_AWS_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
