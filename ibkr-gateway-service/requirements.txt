@@ -1,0 +1,14 @@
+# Base IB API
+ibapi
+
+# Redis client
+redis
+
+# Kafka client
+confluent-kafka
+
+# For environment variable loading (if used, e.g. in config.py)
+# python-dotenv
+
+# Other potential dependencies (logging, etc. are standard library)
+# Add any other specific libraries this service needs

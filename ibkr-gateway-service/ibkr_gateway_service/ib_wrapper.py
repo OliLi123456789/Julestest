@@ -26,8 +26,11 @@ class IBWrapperImpl(EWrapper):
         self.exec_details_queue: List[Dict[str, Any]] = []
         self.portfolio_updates_queue: List[Dict[str, Any]] = []
         self.error_messages_queue: List[Dict[str, Any]] = []
-        # For accountSummary that is not part of a specific request-response pattern
-        self.streaming_account_summary_map: Dict[str, Dict[str, Any]] = {}
+        self.streaming_account_value_queue: List[Dict[str, Any]] = []
+
+        # Commission Report Cache
+        self.commission_reports_cache: Dict[str, CommissionReport] = {}
+        self.commission_reports_cache_lock = threading.Lock()
 
         # Order ID management
         self._next_valid_order_id: Optional[OrderId] = None
@@ -91,31 +94,76 @@ class IBWrapperImpl(EWrapper):
         if advancedOrderRejectJson:
             log_message += f", advancedOrderRejectJson='{advancedOrderRejectJson}'"
 
-        socket_disconnect_codes = [502, 504, 507, 1100, 1300]
-        session_or_data_farm_issue_codes = [501, 503, 509, 1101, 1102, 2103, 2105, 2107, 2108, 2158, 2150]
-        connectivity_info_codes = [2104, 2106, 2157]
-        client_subscription_issue_codes = [2100]
+        socket_disconnect_codes = [502, 504, 507, 1100, 1300] # Errors that mean the socket link is down
+        # Errors that mean the session with TWS/Gateway is problematic, or data farms are down.
+        # Excludes "connection restored/OK" messages.
+        session_or_data_farm_issue_codes = [501, 503, 509, 2103, 2105, 2107, 2158, 2150] # Removed 1101, 1102, 2108
+        # Informational messages about connectivity, including successful (re)connections.
+        connectivity_info_codes = [2104, 2106, 2157, 1101, 1102, 2108] # Added 1101, 1102, 2108
+
+        client_subscription_issue_codes = [2100] # E.g., "New account data requested but not subscribed"
+
+        # Critical errors that might occur after nextValidId indicating fundamental auth/permission issues
+        # These suggest the Gateway session itself is not viable for operations.
+        CRITICAL_POST_CONNECT_ERROR_CODES = [
+            506, # Unsupported TWS version (Gateway cannot login to IBKR backend)
+            530, # Fatal error: User ID or Password check failed (for Gateway automated login)
+            # Add other codes here if they represent similar "session unusable" states discovered post-nextValidId
+            # e.g., specific codes for "Account disabled/not found", "Global trading permission denied for account"
+            # For now, 2100 is a warning, but if "No market data permissions for account X" is a specific code, it could be here.
+        ]
 
         is_socket_disconnect = errorCode in socket_disconnect_codes
         is_session_issue = errorCode in session_or_data_farm_issue_codes
+        is_critical_post_connect_error = errorCode in CRITICAL_POST_CONNECT_ERROR_CODES
 
         if is_socket_disconnect:
             logger.error(log_message + " [SOCKET_DISCONNECT_ERROR]")
             if self.conn_manager: self.conn_manager.signal_connection_lost()
+            # Do not add to queue, connection is lost.
         elif is_session_issue:
             logger.error(log_message + " [SESSION_OR_DATA_FARM_ERROR]")
             if self.conn_manager: self.conn_manager.signal_connection_lost() # Treat as needing full reconnect
+            # Do not add to queue, connection is lost.
+        elif is_critical_post_connect_error:
+            logger.error(log_message + " [CRITICAL_POST_CONNECT_ERROR]")
+            if self.conn_manager:
+                # Check if nextValidId has already been processed by ConnectionManager.
+                # Accessing _next_valid_id_event directly is not ideal but pragmatic for this specific check.
+                if self.conn_manager._next_valid_id_event.is_set():
+                    self.conn_manager.signal_critical_post_connect_error(errorCode, errorString)
+                else:
+                    # If nextValidId hasn't been confirmed yet, treat as an immediate connection failure.
+                    self.conn_manager.signal_connection_lost()
+            # This type of error is connection-level, do not add to general error_messages_queue.
         elif errorCode in connectivity_info_codes:
-            logger.info(log_message + " [CONNECTIVITY_INFO]")
+            # Log specific positive messages differently
+            if errorCode in [1101, 1102, 2104, 2106, 2108, 2157]: # 2157 is "Connectivity to TWS has been resumed"
+                 logger.info(log_message + " [CONNECTIVITY_RESTORED_INFO]")
+            else: # Other general info
+                 logger.info(log_message + " [CONNECTIVITY_INFO]")
+            # These are informational, add to queue if reqId is valid (or always for general info)
+            if reqId != -1 or errorCode in [2104, 2106, 1101, 1102, 2108, 2157]: # Store system-level connectivity info
+                self.error_messages_queue.append({
+                    "reqId": reqId, "errorCode": errorCode, "errorString": errorString,
+                    "advancedOrderRejectJson": advancedOrderRejectJson, "timestamp": time.time(), "type": "info"
+                })
         elif errorCode in client_subscription_issue_codes:
             logger.warning(log_message + " [CLIENT_SUBSCRIPTION_ISSUE]")
-        else:
-            logger.error(log_message + " [REQUEST_SPECIFIC_ERROR_OR_WARNING]")
-
-        if reqId != -1 or is_socket_disconnect or is_session_issue :
-             self.error_messages_queue.append({
+            self.error_messages_queue.append({
                 "reqId": reqId, "errorCode": errorCode, "errorString": errorString,
-                "advancedOrderRejectJson": advancedOrderRejectJson, "timestamp": time.time()
+                "advancedOrderRejectJson": advancedOrderRejectJson, "timestamp": time.time(), "type": "warning"
+            })
+        else: # Default for other errors (typically request-specific)
+            logger.error(log_message + " [REQUEST_SPECIFIC_ERROR_OR_WARNING]")
+            # Add all other errors (usually request-specific) to the queue
+            self.error_messages_queue.append({
+                "reqId": reqId, "errorCode": errorCode, "errorString": errorString,
+                "advancedOrderRejectJson": advancedOrderRejectJson, "timestamp": time.time(), "type": "error"
+            })
+
+    def orderStatus(self, orderId: OrderId, status: str, filled: float, remaining: float, avgFillPrice: float,
+                    permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
             })
 
     def orderStatus(self, orderId: OrderId, status: str, filled: float, remaining: float, avgFillPrice: float,
@@ -157,24 +205,26 @@ class IBWrapperImpl(EWrapper):
     def commissionReport(self, commissionReport: CommissionReport):
         super().commissionReport(commissionReport)
         self._update_last_api_activity_time()
-        logger.info(f"commissionReport: ExecId='{commissionReport.execId}', Comm={commissionReport.commission} {commissionReport.currency}, PNL={commissionReport.realizedPNL}")
-        # ResponseProcessor will need to cache this and link it to the corresponding execDetail
-        # For now, we can queue it or have ResponseProcessor access a map.
-        # Let's queue it for ResponseProcessor to handle.
-        self.exec_details_queue.append({"type": "commission", "report_obj": commissionReport, "received_at": time.time()})
+        with self.commission_reports_cache_lock:
+            self.commission_reports_cache[commissionReport.execId] = commissionReport
+        logger.info(f"Cached commissionReport: ExecId='{commissionReport.execId}', Comm={commissionReport.commission} {commissionReport.currency}")
 
 
     def updateAccountValue(self, key: str, val: str, currency: str, accountName: str):
         super().updateAccountValue(key, val, currency, accountName)
         self._update_last_api_activity_time()
-        log_entry = {"key": key, "val": val, "currency": currency, "accountName": accountName, "timestamp": time.time()}
+        log_entry = {
+            "type": "AccountValueUpdate", # To help ResponseProcessor distinguish
+            "key": key, "val": val, "currency": currency,
+            "accountName": accountName, "timestamp": time.time()
+        }
         key_account_values = ["AccountCode", "TotalCashValue", "NetLiquidation", "BuyingPower", "AvailableFunds", "ExcessLiquidity", "MaintMarginReq", "InitMarginReq"]
         if key in key_account_values:
              logger.info(f"updateAccountValue: Acc='{accountName}', Key='{key}', Val='{val}', Curr='{currency}'")
         else:
-            logger.debug(f"updateAccountValue: {log_entry}")
-        # This is a streaming update, store in a way ResponseProcessor can create AccountValueUpdateEvent
-        self.account_summary_map[f"{accountName}:{key}:{currency}"] = log_entry # Overwrites, effectively latest state
+            logger.debug(f"updateAccountValue (other): {log_entry}")
+
+        self.streaming_account_value_queue.append(log_entry)
 
     def updatePortfolio(self, contract: Contract, position: float, marketPrice: float, marketValue: float,
                         averageCost: float, unrealizedPNL: float, realizedPNL: float, accountName: str):
@@ -204,12 +254,18 @@ class IBWrapperImpl(EWrapper):
         with self._account_summary_lock:
             if reqId in self._account_summary_events:
                 if reqId not in self._account_summary_results:
-                    self._account_summary_results[reqId] = {"account": account, "summary_values": {}}
-                self._account_summary_results[reqId]["summary_values"][tag] = {"value": value, "currency": currency}
+                    self._account_summary_results[reqId] = {"account": account, "summary_values": {}} # type: ignore
+                self._account_summary_results[reqId]["summary_values"][tag] = {"value": value, "currency": currency} # type: ignore
                 logger.debug(f"accountSummary (for active reqId={reqId}): Tag='{tag}', Value='{value}', Acc='{account}'")
-            else: # Streaming update (not part of a specific reqAccountSummary call by this client)
+            else: # Streaming update (not part of a specific reqAccountSummary call by this client, or from general subscription)
+                  # This path is less common for accountSummary; updateAccountValue is more typical for streams.
+                log_entry = {
+                    "type": "AccountSummaryStream", # To help ResponseProcessor distinguish
+                    "account": account, "tag": tag, "value": value,
+                    "currency": currency, "timestamp": time.time()
+                }
                 logger.debug(f"accountSummary (streaming): Account='{account}', Tag='{tag}', Value='{value}', Curr='{currency}'")
-                self.streaming_account_summary_map[f"{account}:{tag}:{currency}"] = {"value": value, "currency": currency, "timestamp": time.time()}
+                self.streaming_account_value_queue.append(log_entry)
 
 
     def accountSummaryEnd(self, reqId: int):
@@ -311,3 +367,11 @@ class IBWrapperImpl(EWrapper):
     #    self._update_last_api_activity_time()
     #    # ...
     # etc. for all other callbacks used.
+
+    def currentTime(self, time_val: int):
+        super().currentTime(time_val)
+        self._update_last_api_activity_time()
+        # Optional: log the time, perhaps at DEBUG level
+        # import datetime
+        # current_time_str = datetime.datetime.fromtimestamp(time_val, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+        # logger.debug(f"currentTime: Server time is {time_val} ({current_time_str})")

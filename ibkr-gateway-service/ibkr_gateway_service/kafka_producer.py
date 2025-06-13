@@ -43,6 +43,8 @@ class BrokerEventProducer:
 
         self.delivery_reports_processed = 0
         self.delivery_errors = 0
+        self.consecutive_delivery_errors = 0
+        self.DELIVERY_ERROR_THRESHOLD = 10 # Configurable: Max consecutive errors before critical alert
 
         # Start a goroutine (in Go) or thread (in Python) for handling delivery reports
         # For Python client, poll() in produce or flush() handles this.
@@ -54,9 +56,20 @@ class BrokerEventProducer:
         self.delivery_reports_processed += 1
         if err is not None:
             self.delivery_errors += 1
+            self.consecutive_delivery_errors += 1
             logger.error(f'BrokerEvent delivery failed for topic {msg.topic()} key {msg.key()}: {err}')
+
+            if self.consecutive_delivery_errors > self.DELIVERY_ERROR_THRESHOLD:
+                logger.critical(
+                    f"CRITICAL_ALERT: BrokerEventProducer: Too many consecutive Kafka delivery failures ({self.consecutive_delivery_errors}). "
+                    f"Last error for topic {msg.topic()} key {msg.key()}: {err}. KAFKA_PRODUCER_FAILURE"
+                )
+                # Alerted, but don't reset consecutive_delivery_errors here; reset on next success.
             # TODO: More robust DLQ or error handling for critical event delivery failures
         else:
+            if self.consecutive_delivery_errors > 0: # Log if we were having issues before this success
+                logger.info(f"BrokerEventProducer: Kafka delivery successful after {self.consecutive_delivery_errors} previous consecutive failures. Resetting error count.")
+            self.consecutive_delivery_errors = 0 # Reset on success
             # This can be very verbose, enable only for debugging.
             # logger.debug(f'BrokerEvent delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()} (Key: {msg.key()})')
             pass

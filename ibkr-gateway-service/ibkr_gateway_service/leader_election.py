@@ -5,6 +5,7 @@ import os
 import uuid # For unique identity if pod name not available
 import random # For jitter
 from typing import Callable
+from datetime import datetime, timedelta, timezone # Added
 
 from kubernetes import client, config as kube_config # Renamed to avoid conflict with local config
 from kubernetes.client.rest import ApiException
@@ -54,6 +55,10 @@ class LeaderElector:
         self.lease_duration_seconds = lease_duration_seconds
         self.renew_deadline_factor = float(renew_deadline_seconds) / float(lease_duration_seconds) # e.g. 10/15 = 0.66
         self.retry_period_seconds = retry_period_seconds
+        self.consecutive_api_errors = 0
+        self.API_ERROR_THRESHOLD = 5 # Configurable: Max K8s API errors before critical alert
+        self.consecutive_lease_acquisition_failures = 0
+        self.LEASE_ACQUISITION_FAILURE_THRESHOLD = 10 # Configurable: Max attempts to acquire lease before alert
 
         # Ensure lease duration is greater than renew deadline
         if renew_deadline_seconds >= lease_duration_seconds:
@@ -62,59 +67,58 @@ class LeaderElector:
             # Actual renew_deadline_seconds = self.lease_duration_seconds * self.renew_deadline_factor
 
 
-    def _try_acquire_or_renew_lease(self):
+    def _try_acquire_or_renew_lease(self) -> bool: # Added return type hint
         try:
             lease = self.coordination_v1_api.read_namespaced_lease(self.lease_name, self.lease_namespace)
+            self.consecutive_api_errors = 0 # Reset on successful read
 
-            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc) # Use timezone-aware UTC now
-            now_micro_time = client.V1MicroTime(now_utc) # K8s client expects V1MicroTime
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_micro_time = client.V1MicroTime(now_utc)
 
             if lease.spec.holder_identity == self.identity:
-                # We are the leader, renew
                 lease.spec.renew_time = now_micro_time
-                # lease.spec.lease_transitions = (lease.spec.lease_transitions or 0) + 1 # K8s client might not like this direct int manipulation
                 self.coordination_v1_api.replace_namespaced_lease(self.lease_name, self.lease_namespace, lease)
+                self.consecutive_api_errors = 0 # Reset on successful replace
                 logger.debug(f"LeaderElector [{self.identity}]: Renewed lease.")
-                if not self.is_leader: # Should not happen if holder_identity is self, but good check
+                if not self.is_leader:
                     logger.info(f"LeaderElector [{self.identity}]: Transitioned to leader (on renew).")
                     self.is_leader = True
                     self.on_started_leading()
                 return True
             else:
-                # Check if current lease is expired
                 lease_expired = False
                 if lease.spec.renew_time and lease.spec.lease_duration_seconds:
-                    # Expiry time = renew_time + lease_duration_seconds
-                    renew_time_dt = lease.spec.renew_time.replace(tzinfo=timezone.utc) # Assume stored as UTC
+                    renew_time_dt = lease.spec.renew_time # Already V1MicroTime, which client converts
+                    # Ensure renew_time_dt is offset-aware for comparison if it's not already
+                    if renew_time_dt.tzinfo is None: # Should not happen with V1MicroTime from API
+                         renew_time_dt = renew_time_dt.replace(tzinfo=timezone.utc)
                     expiry_time = renew_time_dt + timedelta(seconds=lease.spec.lease_duration_seconds)
                     if now_utc > expiry_time:
                         lease_expired = True
                         logger.info(f"LeaderElector [{self.identity}]: Lease held by {lease.spec.holder_identity} found to be expired (expiry: {expiry_time}, now: {now_utc}).")
 
                 if lease.spec.holder_identity is None or lease_expired:
-                    # Try to acquire
                     logger.info(f"LeaderElector [{self.identity}]: Attempting to acquire lease (previous holder: {lease.spec.holder_identity}, expired: {lease_expired}).")
                     lease.spec.holder_identity = self.identity
                     lease.spec.lease_duration_seconds = self.lease_duration_seconds
                     lease.spec.acquire_time = now_micro_time
                     lease.spec.renew_time = now_micro_time
-                    # lease.spec.lease_transitions = (lease.spec.lease_transitions or 0) + 1
                     self.coordination_v1_api.replace_namespaced_lease(self.lease_name, self.lease_namespace, lease)
+                    self.consecutive_api_errors = 0 # Reset on successful replace
                     logger.info(f"LeaderElector [{self.identity}]: Acquired leadership.")
                     if not self.is_leader:
                         self.is_leader = True
                         self.on_started_leading()
                     return True
-                else: # Another instance is the leader and lease is active
-                    if self.is_leader: # We were leader but lost it (e.g. due to network partition and our lease expired)
+                else:
+                    if self.is_leader:
                         logger.warning(f"LeaderElector [{self.identity}]: Lost leadership to {lease.spec.holder_identity}.")
                         self.is_leader = False
                         self.on_stopped_leading()
-                    # else: logger.debug(f"LeaderElector [{self.identity}]: Lease held by {lease.spec.holder_identity}.")
                     return False
 
         except ApiException as e:
-            if e.status == 404: # Lease doesn't exist, try to create
+            if e.status == 404:
                 try:
                     now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
                     now_micro_time = client.V1MicroTime(now_utc)
@@ -127,10 +131,10 @@ class LeaderElector:
                             lease_duration_seconds=self.lease_duration_seconds,
                             acquire_time=now_micro_time,
                             renew_time=now_micro_time,
-                            # lease_transitions=0
                         )
                     )
                     self.coordination_v1_api.create_namespaced_lease(self.lease_namespace, lease_body)
+                    self.consecutive_api_errors = 0 # Reset on successful create
                     logger.info(f"LeaderElector [{self.identity}]: Created and acquired lease.")
                     if not self.is_leader:
                         self.is_leader = True
@@ -138,16 +142,23 @@ class LeaderElector:
                     return True
                 except ApiException as create_e:
                     logger.error(f"LeaderElector [{self.identity}]: Failed to create lease: {create_e}")
-            elif e.status == 409: # Conflict, someone else acquired/updated
+                    self.consecutive_api_errors += 1
+                    if self.consecutive_api_errors > self.API_ERROR_THRESHOLD:
+                        logger.critical(f"CRITICAL_ALERT: LeaderElector [{self.identity}]: Persistent Kubernetes API error when trying to create lease: {create_e}. LEADER_ELECTION_FAILURE")
+            elif e.status == 409:
                  logger.debug(f"LeaderElector [{self.identity}]: Conflict trying to update lease, likely another instance acted faster.")
-            else:
-                logger.error(f"LeaderElector [{self.identity}]: Error interacting with lease API: {e}")
+                 self.consecutive_api_errors = 0 # Conflict is not necessarily our API error, could be normal contention
+            else: # Other K8s API errors
+                self.consecutive_api_errors += 1
+                logger.error(f"LeaderElector [{self.identity}]: Error interacting with lease API (attempt #{self.consecutive_api_errors}): {e}")
+                if self.consecutive_api_errors > self.API_ERROR_THRESHOLD:
+                    logger.critical(f"CRITICAL_ALERT: LeaderElector [{self.identity}]: Persistent Kubernetes API error when trying to manage lease: {e}. LEADER_ELECTION_FAILURE")
 
-            if self.is_leader: # If any error occurred while we thought we were leader
+            if self.is_leader:
                 self.is_leader = False
                 self.on_stopped_leading()
             return False
-        except Exception as e_general: # Catch other potential errors like time parsing
+        except Exception as e_general:
             logger.error(f"LeaderElector [{self.identity}]: General exception in _try_acquire_or_renew_lease: {e_general}", exc_info=True)
             if self.is_leader:
                 self.is_leader = False
@@ -159,6 +170,22 @@ class LeaderElector:
         logger.info(f"LeaderElector [{self.identity}]: Starting election loop.")
         while not self._stop_event.is_set():
             acquired_or_renewed = self._try_acquire_or_renew_lease()
+
+            if self.is_leader and acquired_or_renewed: # Successfully renewed or maintained leadership
+                self.consecutive_lease_acquisition_failures = 0
+            elif not self.is_leader and not acquired_or_renewed: # Failed to acquire
+                self.consecutive_lease_acquisition_failures += 1
+                logger.warning(f"LeaderElector [{self.identity}]: Failed to acquire/renew lease (attempt #{self.consecutive_lease_acquisition_failures}).")
+                if self.consecutive_lease_acquisition_failures > self.LEASE_ACQUISITION_FAILURE_THRESHOLD:
+                    logger.critical(
+                        f"CRITICAL_ALERT: LeaderElector [{self.identity}]: Consistently failing to acquire/renew lease after "
+                        f"{self.consecutive_lease_acquisition_failures} attempts. Possible K8s API issue or lease contention. LEADER_ELECTION_LEASE_CONTENTION_OR_FAILURE"
+                    )
+                    # Optionally reset to avoid continuous alerts for the same prolonged failure, or use timed alert suppression
+                    # self.consecutive_lease_acquisition_failures = 0
+            elif not self.is_leader and acquired_or_renewed: # Acquired leadership
+                 self.consecutive_lease_acquisition_failures = 0
+
 
             # Determine sleep duration
             sleep_duration = self.retry_period_seconds

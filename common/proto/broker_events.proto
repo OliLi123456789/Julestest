@@ -6,32 +6,75 @@ package broker_events;
 // Assuming Go and Python generated code will be placed in these locations
 // relative to a common 'prop-firm-platform' root or a shared 'common' module.
 option go_package = "prop-firm-platform/common/gen/go/broker_events;broker_events";
-option python_package = "common.gen.python.broker_events"; // For Python import structure
+// python_package option removed as it causes issues with protoc in this environment.
+// Python files will be placed manually or with adjusted protoc output paths.
 
-import "google/protobuf/timestamp.proto";
+// Enum definitions
+enum SecurityType {
+  SECURITY_TYPE_UNSPECIFIED = 0;
+  STK = 1;    // Stock
+  OPT = 2;    // Option
+  FUT = 3;    // Future
+  CASH = 4;   // Forex pair
+  CRYPTO = 5; // Cryptocurrency
+  IND = 6;    // Index
+  FOP = 7;    // Future Option
+  // Add others as known, e.g., BOND, CFD, FUND, WAR, IOPT, BAG
+}
+
+enum OptionRight {
+  OPTION_RIGHT_UNSPECIFIED = 0;
+  CALL = 1; // Call option ("C")
+  PUT = 2;  // Put option ("P")
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  PENDING_SUBMIT = 1;   // Order has been accepted by TWS and is awaiting transmission.
+  API_PENDING = 2;      // Order has been accepted by API but not yet acknowledged by TWS. (Custom status for this system if needed)
+  PENDING_CANCEL = 3;   // Order is awaiting cancellation.
+  PRE_SUBMITTED = 4;    // Order has been validated by TWS but not yet submitted to an exchange.
+  SUBMITTED = 5;        // Order has been transmitted to an exchange.
+  API_CANCELLED = 6;    // Cancellation request has been accepted by API but not yet acknowledged by TWS. (Custom for this system)
+  CANCELLED = 7;        // Order has been cancelled.
+  FILLED = 8;           // Order has been completely filled.
+  INACTIVE = 9;         // Order is not active (e.g., an order held in TWS that is not working).
+  // Other IBKR statuses: PartiallyFilled (treat as Submitted with partial fills),
+  // Error, AlgoInProgress, AlgoCancelled, AlgoDone etc.
+  // For simplicity, this enum covers common final and intermediate states.
+  // Application logic can handle transitions and partial fills based on OrderStatusEvent data.
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  BUY = 1;  // Buy order (IBKR: "BOT")
+  SELL = 2; // Sell order (IBKR: "SLD")
+  // Other sides like SSHORT (Sell Short) can be added if needed, mapped from specific IBKR actions.
+}
+
 
 // BrokerInstrument can be used by multiple event types.
 // It represents key details of a financial instrument as understood by the broker.
 message BrokerInstrument {
-  string symbol            = 1;    // e.g., AAPL, EUR, BTC
-  string sec_type          = 2;    // STK, OPT, FUT, CASH, CRYPTO etc. (IBKR specific usually)
-  string exchange          = 3;    // Target exchange, e.g., SMART, NASDAQ, CME, IDEALPRO, PAXOS
+  string symbol            = 1;    // Ticker or symbol, normalized as expected by broker API (e.g., AAPL, EUR, BTC)
+  SecurityType sec_type    = 2;    // Security type (e.g., STK, OPT, FUT). (IBKR specific usually)
+  string exchange          = 3;    // Target exchange, e.g., SMART, NASDAQ, CME, IDEALPRO, PAXOS. Normalized exchange identifier.
   string currency          = 4;    // e.g., USD, EUR
   int64  con_id            = 5;    // Interactive Brokers Contract ID (if available and resolved)
   string last_trade_date_or_contract_month = 6; // YYYYMM or YYYYMMDD
   double strike            = 7;    // For OPT/FOP
-  string right             = 8;    // "C" or "P" for OPT/FOP
-  string multiplier        = 9;    // For OPT/FUT
-  string primary_exchange  = 10;   // For STK on SMART, e.g., ISLAND, NYSE
+  OptionRight right        = 8;    // For OPT/FOP. Application maps "C" or "P" to this.
+  string multiplier        = 9;    // Contract multiplier, e.g., "100" for standard US equity options. String for flexibility.
+  string primary_exchange  = 10;   // For STK on SMART, e.g., ISLAND, NYSE. Hint for routing; may not be execution venue.
   // string local_symbol   = 11;   // If different from symbol
   // string trading_class  = 12;
 }
 
 message OrderStatusEvent {
   string platform_order_id = 1;  // Platform's unique internal order ID
-  int64  broker_order_id   = 2;  // IBKR's orderId (client-side)
-  int32  perm_id           = 3;  // IBKR's permId (permanent, globally unique ID)
-  string status            = 4;  // e.g., PendingSubmit, ApiPending, PendingCancel, PreSubmitted, Submitted, ApiCancelled, Cancelled, Filled, Inactive
+  int64  broker_order_id   = 2;  // IBKR's orderId (client-side ID for this order, unique per session/client ID)
+  int32  perm_id           = 3;  // IBKR's permId (permanent, globally unique ID across sessions/accounts for this order)
+  OrderStatus status       = 4;  // e.g., PendingSubmit, Submitted, Filled. Application maps IBKR string status.
   double filled_quantity   = 5;
   double remaining_quantity = 6;
   double average_fill_price = 7;
@@ -39,7 +82,7 @@ message OrderStatusEvent {
   int32  client_id         = 9;  // IBKR TWS client ID that managed this order
   string why_held          = 10; // Reason if order is held by IB (e.g., "locate")
   double mkt_cap_price     = 11; // For peg-to-market-cap orders
-  google.protobuf.Timestamp event_timestamp_utc = 12; // When this status event was generated/processed by our service
+  int64 event_timestamp_ns = 12; // When this status event was generated/processed by our service (Unix nanoseconds UTC)
   string ib_account_id     = 13; // IBKR Account ID this order belongs to
   // string parent_broker_order_id = 14; // If part of a parent/child order structure
 }
@@ -50,30 +93,33 @@ message CommissionReportData {
     string currency           = 3;
     double realized_pnl       = 4;
     double yield              = 5; // If applicable (e.g., for bonds)
-    int32  yield_redemption_date = 6; // YYYYMMDD format as integer (or string)
+    int32  yield_redemption_date = 6; // YYYYMMDD format as integer
 }
 
 message ExecutionReportEvent {
   string platform_order_id = 1;  // Platform's internal order ID
-  int64  broker_order_id   = 2;  // IBKR's orderId
+  int64  broker_order_id   = 2;  // IBKR's orderId (client-side ID for this order)
   string execution_id      = 3;  // IBKR's execId (unique for each fill segment)
-  int32  perm_id           = 15; // IBKR's permId for the order
+  int32  perm_id           = 15; // IBKR's permId for the order (globally unique permanent ID)
   BrokerInstrument instrument = 4;
-  string side              = 5;  // "BOT" or "SLD"
+  OrderSide side           = 5;  // "BOT" or "SLD" mapped to BUY/SELL by application
   double filled_quantity   = 6;  // Shares/contracts in this specific fill segment
   double fill_price        = 7;
-  string execution_time_str= 8;  // From IBKR (e.g., "YYYYMMDD  HH:MM:SS" - often in TWS local time or specific TZ)
-  string executing_exchange= 9;  // Actual execution exchange if different from order's exchange
+  // From IBKR (e.g., "YYYYMMDD  HH:MM:SS" - often in TWS local time or specific TZ).
+  // Application layer is responsible for parsing this string, converting to UTC,
+  // and populating execution_timestamp_ns.
+  int64 execution_timestamp_ns = 8; // Execution time from broker, converted to Unix nanoseconds UTC.
+  string executing_exchange= 9;  // Actual execution exchange if different from order's exchange. Normalized exchange identifier.
   string currency          = 10; // From contract usually, but good to have
   CommissionReportData commission_data = 11; // Optional, can be linked later or included if available with exec
-  google.protobuf.Timestamp event_timestamp_utc = 12; // When this event was generated/processed by our service
+  int64 event_timestamp_ns = 12; // When this event was generated/processed by our service (Unix nanoseconds UTC)
   string ib_account_id     = 13; // IBKR Account ID
   double average_price     = 14; // Average price of all fills for this orderId (cumQty/avgPx from execution object)
   double cumulative_quantity = 16; // Cumulative quantity filled for this orderId
 }
 
 message AccountSummaryValue {
-    string tag      = 1;
+    string tag      = 1;    // e.g., "NetLiquidation", "TotalCashValue", "BuyingPower"
     string value    = 2;
     string currency = 3;
     string account_id = 4; // The account this tag belongs to
@@ -83,7 +129,7 @@ message AccountSummaryValue {
 message AccountSummarySnapshotEvent {
   string account_id_filter = 1; // The account requested (or "All" for all subscribed)
   map<string, AccountSummaryValue> summary_values = 2; // Keyed by tag (e.g., "NetLiquidation", "BuyingPower")
-  google.protobuf.Timestamp event_timestamp_utc = 3;
+  int64 event_timestamp_ns = 3; // Timestamp of snapshot generation (Unix nanoseconds UTC)
   bool   is_snapshot_end = 4; // True if from accountSummaryEnd, indicating this snapshot is complete for the reqId
   int32  request_id = 5;      // reqId from original request if applicable
 }
@@ -94,7 +140,7 @@ message AccountValueUpdateEvent {
     string key        = 2; // The specific account key being updated (e.g., "TotalCashValue")
     string value      = 3;
     string currency   = 4;
-    google.protobuf.Timestamp event_timestamp_utc = 5;
+    int64 event_timestamp_ns = 5; // Timestamp of value update (Unix nanoseconds UTC)
 }
 
 message PortfolioUpdateEvent {
@@ -106,7 +152,7 @@ message PortfolioUpdateEvent {
   double average_cost      = 6;
   double unrealized_pnl    = 7;
   double realized_pnl      = 8; // Realized PNL for this specific position/contract (usually 0 unless closed)
-  google.protobuf.Timestamp event_timestamp_utc = 9;
+  int64 event_timestamp_ns = 9; // Timestamp of portfolio update (Unix nanoseconds UTC)
 }
 
 message BrokerErrorEvent {
@@ -114,6 +160,6 @@ message BrokerErrorEvent {
     int32  error_code = 2;
     string error_message = 3;
     string advanced_order_reject_json = 4; // Optional: advanced error details if provided
-    google.protobuf.Timestamp event_timestamp_utc = 5;
+    int64 event_timestamp_ns = 5; // Timestamp of error event (Unix nanoseconds UTC)
     string source_client_id = 6; // IBKR Client ID that generated/received the error
 }

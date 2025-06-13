@@ -9,50 +9,79 @@ package market_data;
 // E.g., if your go.mod is 'github.com/yourorg/prop-firm-platform', then
 // go_package = "github.com/yourorg/prop-firm-platform/common/gen/go/market_data;market_data";
 option go_package = "prop-firm-platform/common/gen/go/market_data;market_data";
+// python_package option removed.
 
 // Import for google.protobuf.Timestamp if you prefer to use it,
 // but int64 for nanoseconds is also common and often simpler.
 // import "google/protobuf/timestamp.proto";
 
+
+// Enum Definitions
+enum MarketTape {
+  MARKET_TAPE_UNSPECIFIED = 0;
+  CTA_A = 1; // CTA Tape A (NYSE)
+  CTA_B = 2; // CTA Tape B (NYSE Arca, NYSE American, other regional)
+  UTP_C = 3; // UTP Tape C (NASDAQ)
+  // Add others if known from Polygon/other providers e.g. OPRA for options
+}
+
+enum AggregateTimeframe {
+  AGGREGATE_TIMEFRAME_UNSPECIFIED = 0;
+  S1 = 1;   // 1 Second
+  M1 = 2;   // 1 Minute
+  M5 = 3;   // 5 Minutes
+  M15 = 4;  // 15 Minutes
+  M30 = 5;  // 30 Minutes
+  H1 = 6;   // 1 Hour
+  D1 = 7;   // 1 Day
+  W1 = 8;   // 1 Week
+  Mo1 = 9;  // 1 Month (Mo to distinguish from M for minute)
+  Q1 = 10;  // 1 Quarter
+  Y1 = 11;  // 1 Year
+}
+
+
 // --- Canonical Trade Message ---
 message Trade {
-  string ticker         = 1;  // Ticker symbol (e.g., AAPL, EUR/USD, X:BTCUSD)
+  string ticker         = 1;  // Normalized ticker symbol (e.g., AAPL, X:BTCUSD, C:EURUSD)
   double price          = 2;  // Trade price
   int64  size           = 3;  // Trade size/volume
-  int64  timestamp_ns   = 4;  // Nanosecond epoch timestamp of the trade event (UTC)
-  string exchange       = 5;  // Exchange ID or code where the trade occurred (normalized string)
-  repeated string conditions = 6; // Trade conditions/flags (normalized strings)
-  string tape           = 7;  // Tape where the trade was reported (for US stocks, normalized string)
+  int64  timestamp_ns   = 4;  // Nanosecond epoch timestamp of the trade event (Unix nanoseconds UTC)
+  string exchange       = 5;  // Normalized exchange identifier (e.g., MIC code or consistent internal representation)
+  repeated string conditions = 6; // List of normalized trade condition codes
+  MarketTape tape       = 7;  // Tape where the trade was reported (for US stocks)
   string id             = 8;  // Unique trade ID from the provider, if available
-  // Consider adding participant_timestamp_ns if available and important
+  // Consider adding participant_timestamp_ns if available and important (timestamp from exchange participant)
+  // Consider adding received_timestamp_ns (timestamp when ingested by our system)
 }
 
 // --- Canonical Quote Message (NBBO or individual book level) ---
 message Quote {
-  string ticker         = 1;  // Ticker symbol
+  string ticker         = 1;  // Normalized ticker symbol (e.g., AAPL, X:BTCUSD, C:EURUSD)
   double bid_price      = 2;  // Bid price
   int64  bid_size       = 3;  // Bid size (number of shares/contracts)
-  string bid_exchange   = 4;  // Exchange ID or code for the bid (normalized string)
+  string bid_exchange   = 4;  // Normalized exchange identifier for the bid (e.g., MIC code)
   double ask_price      = 5;  // Ask price
   int64  ask_size       = 6;  // Ask size
-  string ask_exchange   = 7;  // Exchange ID or code for the ask (normalized string)
-  int64  timestamp_ns   = 8;  // Nanosecond epoch timestamp of the quote event (UTC)
-  repeated string conditions = 9; // Quote conditions/flags (normalized strings)
-  string tape           = 10; // Tape where the quote was reported (for US stocks, normalized string)
+  string ask_exchange   = 7;  // Normalized exchange identifier for the ask (e.g., MIC code)
+  int64  timestamp_ns   = 8;  // Nanosecond epoch timestamp of the quote event (Unix nanoseconds UTC)
+  repeated string conditions = 9; // List of normalized quote condition codes
+  MarketTape tape       = 10; // Tape where the quote was reported (for US stocks)
   // Consider adding quote_type (e.g., NBBO, BBO, individual_exchange_quote)
+  // Consider adding received_timestamp_ns (timestamp when ingested by our system)
 }
 
 // --- Canonical Aggregate (Bar/Candle) Message ---
 message Aggregate {
-  string ticker         = 1;  // Ticker symbol
+  string ticker         = 1;  // Normalized ticker symbol (e.g., AAPL, X:BTCUSD, C:EURUSD)
   double open           = 2;  // Open price for the aggregate period
   double high           = 3;  // High price for the aggregate period
   double low            = 4;  // Low price for the aggregate period
   double close          = 5;  // Close price for the aggregate period
   int64  volume         = 6;  // Volume for the aggregate period
-  double vwap           = 7;  // Volume Weighted Average Price (optional, ensure consistency in float vs int64 if used)
-  int64  start_time_ns  = 8;  // Nanosecond epoch timestamp of the aggregate start (UTC)
-  int64  end_time_ns    = 9;  // Nanosecond epoch timestamp of the aggregate end (UTC) (derived from start_time + duration)
-  string timeframe      = 10; // e.g., "S1" (1sec), "M1", "M5", "H1", "D1" (standardized representation)
+  double vwap           = 7;  // Volume Weighted Average Price for the aggregate period (optional)
+  int64  start_time_ns  = 8;  // Nanosecond epoch timestamp of the aggregate start (Unix nanoseconds UTC)
+  int64  end_time_ns    = 9;  // Nanosecond epoch timestamp of the aggregate end (Unix nanoseconds UTC) (derived from start_time + duration)
+  AggregateTimeframe timeframe = 10; // Timeframe of the aggregate (e.g., M1, H1, D1)
   int64  transactions   = 11; // Number of transactions in the aggregate (optional)
 }

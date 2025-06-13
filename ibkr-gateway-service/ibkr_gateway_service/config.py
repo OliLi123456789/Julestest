@@ -13,9 +13,12 @@ class IBKRConfig:
     client_id: int  # For TWS API connection
     account_code: Optional[str]  # Trading account code, if needed
 
-    # Names of secrets in AWS Secrets Manager
-    username_secret_name: str # For IB Gateway login (often automated by IBController)
-    password_secret_name: str # For IB Gateway login (often automated by IBController)
+    # Names of secrets in AWS Secrets Manager for IBKR Gateway application login.
+    # These are NOT used directly by EClient.connect() for the API socket connection,
+    # but are intended for external tools (e.g., IBController, custom scripts)
+    # that might automate the login process of the IBKR Gateway application itself.
+    username_secret_name: str
+    password_secret_name: str
 
     # 2FA / IB Key related configuration - depends heavily on chosen automation method
     # For example, if using ib_insync with IBController which handles TOTP:
@@ -23,8 +26,11 @@ class IBKRConfig:
     # ib_key_totp_secret_name: Optional[str] = None # Secret name for the TOTP key if IBController needs it
 
     connect_timeout_seconds: int = 20
+    post_connect_error_grace_seconds: float = 3.0 # Grace period for critical errors after nextValidId
     max_reconnect_attempts: int = 0 # 0 for indefinite, >0 for specific count
     reconnect_interval_seconds: int = 10
+    active_keepalive_interval_seconds: int = 30 # Interval for sending keepalive pings
+    keepalive_activity_check_threshold_seconds: int = 25 # Threshold to skip ping if recent activity
     # Pacing/Rate limit config for requests sent TO IBKR
     max_requests_per_second: int = 40 # Stay under IBKR's typical 50 req/sec limit
     max_silence_duration_seconds: int = 90 # New for stale connection detection
@@ -36,6 +42,7 @@ class KafkaConfig:  # For publishing responses/events from IBKR
     account_data_topic: str
     position_data_topic: str
     error_events_topic: str
+    oms_order_requests_topic: str # Topic for receiving order requests from OMS
 
 class LeaderElectionConfig:
     lease_name: str
@@ -44,10 +51,17 @@ class LeaderElectionConfig:
     renew_deadline_seconds: int
     retry_period_seconds: int
 
+class RedisConfig:
+    host: str
+    port: int
+    db: int
+    password_secret_name: Optional[str] = None
+
 class Config:
     ibkr: IBKRConfig
     kafka: KafkaConfig
-    leader_election: LeaderElectionConfig # Added LeaderElectionConfig
+    leader_election: LeaderElectionConfig
+    redis: RedisConfig # Added RedisConfig
     aws_region: str
     service_instance_id: str
     log_level: str = "INFO"
@@ -82,6 +96,9 @@ def load_config() -> Config:
         username_secret_name=ibkr_username_secret_name or "", # Store name even if empty
         password_secret_name=ibkr_password_secret_name or "", # Store name even if empty
         connect_timeout_seconds=int(os.getenv("IBKR_CONNECT_TIMEOUT_SECONDS", "20")),
+        post_connect_error_grace_seconds=float(os.getenv("IBKR_POST_CONNECT_GRACE_SECONDS", "3.0")),
+        active_keepalive_interval_seconds=int(os.getenv("IBKR_ACTIVE_KEEPALIVE_INTERVAL_SECONDS", "30")),
+        keepalive_activity_check_threshold_seconds=int(os.getenv("IBKR_KEEPALIVE_ACTIVITY_CHECK_THRESHOLD_SECONDS", "25")),
             max_reconnect_attempts=int(os.getenv("IBKR_MAX_RECONNECT_ATTEMPTS", "0")),
         reconnect_interval_seconds=int(os.getenv("IBKR_RECONNECT_INTERVAL_SECONDS", "15")),
         max_requests_per_second=int(os.getenv("IBKR_MAX_REQUESTS_PER_SECOND", "40")),
@@ -96,7 +113,8 @@ def load_config() -> Config:
         execution_reports_topic=os.getenv("KAFKA_EXECUTION_REPORTS_TOPIC", "ibkr.execution-reports"),
         account_data_topic=os.getenv("KAFKA_ACCOUNT_DATA_TOPIC", "ibkr.account-data"),
         position_data_topic=os.getenv("KAFKA_POSITION_DATA_TOPIC", "ibkr.position-data"),
-        error_events_topic=os.getenv("KAFKA_ERROR_EVENTS_TOPIC", "ibkr.error-events")
+        error_events_topic=os.getenv("KAFKA_ERROR_EVENTS_TOPIC", "ibkr.error-events"),
+        oms_order_requests_topic=os.getenv("OMS_ORDER_REQUESTS_TOPIC", "oms.order-requests")
     )
 
     log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -117,9 +135,20 @@ def load_config() -> Config:
         retry_period_seconds=int(os.getenv("LEADER_ELECTION_RETRY_PERIOD_SECONDS", "2"))
     )
 
+    redis_config = RedisConfig(
+        host=os.getenv("REDIS_HOST", ""), # Empty host string means Redis is disabled
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        password_secret_name=os.getenv("REDIS_PASSWORD_SECRET_NAME")
+    )
+
     logger.info(f"IBKR Config Loaded: Host={ibkr_config.gateway_host}:{ibkr_config.gateway_port}, ClientID={ibkr_config.client_id}")
     logger.info(f"Kafka Config Loaded: Brokers='{kafka_config.bootstrap_servers}'")
     logger.info(f"LeaderElection Config Loaded: LeaseName='{leader_election_config.lease_name}', Namespace='{leader_election_config.lease_namespace}'")
+    if redis_config.host:
+        logger.info(f"Redis Config Loaded: Host={redis_config.host}:{redis_config.port}, DB={redis_config.db}")
+    else:
+        logger.info("Redis Config: Host not set, Redis integration will be disabled for OrderIdMapper.")
 
 
     return Config(
@@ -128,5 +157,6 @@ def load_config() -> Config:
         ibkr=ibkr_config,
         kafka=kafka_config,
         leader_election=leader_election_config,
+        redis=redis_config,
         log_level=log_level_str
     )

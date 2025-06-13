@@ -61,11 +61,11 @@ class ResponseProcessor:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.consecutive_processing_errors = 0
+        self.PROCESSING_ERROR_THRESHOLD = 5 # Max consecutive errors in main loop before CRITICAL_ALERT
 
-        # To store linked commission reports temporarily
-        self._commission_reports_by_exec_id: Dict[str, broker_pb.CommissionReportData] = {}
-        self._commission_report_lock = threading.Lock()
-
+        # self._commission_reports_by_exec_id and self._commission_report_lock are removed
+        # as commission reports are now cached in IBWrapperImpl.
 
     def _process_order_status_queue(self):
         processed_count = 0
@@ -108,7 +108,7 @@ class ResponseProcessor:
 
     def _process_exec_details_queue(self):
         processed_count = 0
-        while self.wrapper.exec_details_queue:
+        while self.wrapper.exec_details_queue: # This queue now only contains execution details
             try:
                 exec_data_item = self.wrapper.exec_details_queue.pop(0)
             except IndexError:
@@ -116,20 +116,52 @@ class ResponseProcessor:
             processed_count += 1
 
             try:
+                # Ensure item is an execution detail, not a mis-queued commission report
+                if "execution" not in exec_data_item or "contract" not in exec_data_item:
+                    logger.warning(f"Skipping unexpected item in exec_details_queue: {exec_data_item}")
+                    continue
+
                 ib_contract = exec_data_item["contract"]    # ibapi.contract.Contract
                 ib_execution = exec_data_item["execution"]  # ibapi.execution.Execution
+                received_at = exec_data_item.get("received_at", time.time())
+
 
                 platform_order_id = self.order_id_mapper.get_internal_id(ib_execution.orderId)
                 if not platform_order_id:
                     logger.debug(f"No platform_order_id mapping for broker_order_id {ib_execution.orderId} in exec {ib_execution.execId}. Publishing with broker_order_id only.")
                     platform_order_id = f"UNMAPPED_IB_{ib_execution.orderId}"
 
-                # Check for and link commission report
-                commission_data = broker_pb.CommissionReportData() # Default empty
-                with self._commission_report_lock:
-                    if ib_execution.execId in self._commission_reports_by_exec_id:
-                        commission_data = self._commission_reports_by_exec_id.pop(ib_execution.execId)
-                        logger.debug(f"Found and linked commission report for execId {ib_execution.execId}")
+                # Attempt to link commission report from IBWrapperImpl's cache
+                commission_data_proto = broker_pb.CommissionReportData() # Default empty
+                with self.wrapper.commission_reports_cache_lock: # Use wrapper's lock
+                    if ib_execution.execId in self.wrapper.commission_reports_cache:
+                        cached_commission_report = self.wrapper.commission_reports_cache.pop(ib_execution.execId)
+                        # Normalize ibapi.CommissionReport to broker_pb.CommissionReportData
+                        commission_data_proto = broker_pb.CommissionReportData(
+                            execution_id=cached_commission_report.execId, # Corrected field name
+                            commission=cached_commission_report.commission,
+                            currency=cached_commission_report.currency,
+                            realized_pnl=cached_commission_report.realizedPNL,
+                            yield_val=getattr(cached_commission_report, 'yield', 0.0), # 'yield' might not always exist
+                            yield_redemption_date=getattr(cached_commission_report, 'yieldRedemptionDate', 0) # int YYYYMMDD
+                        )
+                        logger.info(f"Found and linked commission report for execId {ib_execution.execId}")
+                    else:
+                        logger.debug(f"No commission report found in cache for execId {ib_execution.execId}")
+
+                # Placeholder for execution_timestamp_ns until parsing logic is added/confirmed
+                # execution_time_ib = ib_execution.time # Format "YYYYMMDD  HH:MM:SS" (potentially local TWS time)
+                # execution_timestamp_ns_val = 0 # Default to 0 or handle missing
+                # if execution_time_ib:
+                #     try:
+                #         # This is a placeholder - robust parsing/conversion needed
+                #         dt_obj = datetime.datetime.strptime(execution_time_ib, "%Y%m%d  %H:%M:%S")
+                #         # TODO: Confirm timezone of execution.time from IBKR. Assume UTC for now if not specified.
+                #         # If it's local, it needs to be converted to UTC.
+                #         execution_timestamp_ns_val = int(dt_obj.replace(tzinfo=datetime.timezone.utc).timestamp() * 1e9)
+                #     except ValueError as ve:
+                #         logger.error(f"Could not parse execution time '{execution_time_ib}': {ve}")
+
 
                 event = broker_pb.ExecutionReportEvent(
                     platform_order_id=platform_order_id,
@@ -140,13 +172,13 @@ class ResponseProcessor:
                     side=ib_execution.side,
                     filled_quantity=float(ib_execution.shares), # Ensure float
                     fill_price=ib_execution.price,
-                    execution_time_str=ib_execution.time,
-                    executing_exchange=ib_execution.exchange,
-                    currency=ib_contract.currency,
-                    commission_data=commission_data,
-                    event_timestamp_utc=_get_proto_timestamp(exec_data_item.get("received_at")),
-                    ib_account_id=ib_execution.acctNumber,
-                    average_price=ib_execution.avgPrice,
+                    # execution_timestamp_ns=execution_timestamp_ns_val, # Requires parsing execution.time
+                    executing_exchange=ib_execution.exchange, # This is from Execution object
+                    currency=ib_contract.currency, # From Contract object
+                    commission_data=commission_data_proto, # Use the populated or empty proto
+                    event_timestamp_utc=_get_proto_timestamp(received_at),
+                    ib_account_id=ib_execution.acctNumber, # From Execution object
+                    average_price=ib_execution.avgPrice, # From Execution object
                     cumulative_quantity=float(ib_execution.cumQty) # Ensure float
                 )
                 self.kafka_producer.publish_message(event, event.execution_id, self.kafka_cfg.execution_reports_topic)
@@ -273,32 +305,104 @@ class ResponseProcessor:
                 logger.error(f"Error processing broker error message from queue: {error_data} - {e}", exc_info=True)
         # if processed_count > 0: logger.debug(f"Processed {processed_count} error messages.")
 
+    def _process_streaming_account_values_queue(self):
+        """Processes AccountValueUpdate and streaming AccountSummary items from IBWrapperImpl."""
+        processed_count = 0
+        # Ensure this queue exists on the wrapper instance
+        queue_to_process = getattr(self.wrapper, 'streaming_account_value_queue', None)
+        if not queue_to_process:
+            # logger.debug("streaming_account_value_queue not found on wrapper. Skipping.") # Can be noisy
+            return
+
+        while queue_to_process: # Process all available at this moment
+            try:
+                item = queue_to_process.pop(0)
+            except IndexError:
+                break # Queue is empty
+            processed_count +=1
+
+            try:
+                item_type = item.get("type")
+                timestamp = item.get("timestamp", time.time()) # Fallback to now if timestamp missing
+
+                if item_type == "AccountValueUpdate":
+                    # This is from IBWrapperImpl.updateAccountValue
+                    event = broker_pb.AccountValueUpdateEvent(
+                        account_id=item["accountName"],
+                        key=item["key"],
+                        value=item["val"],
+                        currency=item["currency"],
+                        event_timestamp_utc=_get_proto_timestamp(timestamp)
+                    )
+                    kafka_key = f"{item['accountName']}:{item['key']}"
+                    self.kafka_producer.publish_message(event, kafka_key, self.kafka_cfg.account_data_topic)
+
+                elif item_type == "AccountSummaryStream":
+                    # This is from IBWrapperImpl.accountSummary for non-awaited reqIds
+                    # Treated similarly to AccountValueUpdateEvent, mapping 'tag' to 'key'.
+                    event = broker_pb.AccountValueUpdateEvent(
+                        account_id=item["account"],
+                        key=item["tag"], # Map 'tag' from accountSummary to 'key'
+                        value=item["value"],
+                        currency=item["currency"],
+                        event_timestamp_utc=_get_proto_timestamp(timestamp)
+                    )
+                    kafka_key = f"{item['account']}:{item['tag']}"
+                    self.kafka_producer.publish_message(event, kafka_key, self.kafka_cfg.account_data_topic)
+                else:
+                    logger.warning(f"Unknown item type in streaming_account_value_queue: {item_type}. Item: {item}")
+
+            except Exception as e:
+                logger.error(f"Error processing streaming account value message {item}: {e}", exc_info=True)
+        # if processed_count > 0: logger.debug(f"Processed {processed_count} streaming account value events.")
+
     def _run_processor_loop(self):
         logger.info("ResponseProcessor loop started.")
         while not self._stop_event.is_set():
+            processed_something_in_pass = False
             try:
-                self._process_order_status_queue()
-                self._process_exec_details_queue()
-                self._process_portfolio_updates_queue()
-                # self._process_account_summary_events() # Refine this based on how wrapper provides summary data
-                self._process_error_messages_queue()
+                # Process all queues
+                if self.wrapper.order_status_queue:
+                    self._process_order_status_queue()
+                    processed_something_in_pass = True
+                if self.wrapper.exec_details_queue:
+                    self._process_exec_details_queue()
+                    processed_something_in_pass = True
+                if self.wrapper.portfolio_updates_queue:
+                    self._process_portfolio_updates_queue()
+                    processed_something_in_pass = True
+                if self.wrapper.error_messages_queue:
+                    self._process_error_messages_queue()
+                    processed_something_in_pass = True
 
-                # Check if any work was done
-                # This is a simple way to avoid tight loop if all queues are consistently empty.
-                # More sophisticated would be to use blocking queues or condition variables.
-                # For now, a short sleep if all known queues were empty in this pass.
-                # (This logic needs refinement as .pop(0) will raise IndexError if empty)
-                # A better check might be:
-                all_queues_empty = not (self.wrapper.order_status_queue or \
-                                       self.wrapper.exec_details_queue or \
-                                       self.wrapper.portfolio_updates_queue or \
-                                       self.wrapper.error_messages_queue) # and other relevant queues
+                queue_to_process = getattr(self.wrapper, 'streaming_account_value_queue', None)
+                if queue_to_process and queue_to_process: # Check if queue exists and is not empty
+                    self._process_streaming_account_values_queue()
+                    processed_something_in_pass = True
 
-                if all_queues_empty:
-                    time.sleep(0.01) # Sleep briefly (e.g., 10ms)
+                # If any processing happened or all queues were empty (implying a successful idle pass)
+                # reset consecutive error count.
+                self.consecutive_processing_errors = 0 # Reset on successful pass through all queues
+
+                if not processed_something_in_pass: # All known queues were empty
+                    self._stop_event.wait(timeout=0.01) # Sleep briefly, also checks stop_event
+
             except Exception as e:
-                logger.error(f"Exception in ResponseProcessor loop: {e}", exc_info=True)
-                time.sleep(1) # Avoid rapid looping on persistent error
+                self.consecutive_processing_errors += 1
+                logger.error(f"Exception in ResponseProcessor loop (attempt #{self.consecutive_processing_errors}): {e}", exc_info=True)
+                if self.consecutive_processing_errors > self.PROCESSING_ERROR_THRESHOLD:
+                    logger.critical(
+                        f"CRITICAL_ALERT: ResponseProcessor: Too many consecutive errors in processing loop ({self.consecutive_processing_errors}). "
+                        f"Last error: {e}. RESPONSE_PROCESSOR_FAILURE", exc_info=True
+                    )
+                    # Do not reset counter here, so it keeps alerting if problem persists in next iterations,
+                    # or reset after a cool-down period if alert fatigue is a concern.
+                    # For this implementation, it will alert every time after threshold is crossed if error continues.
+
+                # Avoid rapid looping on persistent error by sleeping
+                # The sleep duration could be made configurable or increase exponentially.
+                self._stop_event.wait(timeout=1.0) # Sleep for 1s, also checks stop_event
+
         logger.info("ResponseProcessor loop stopped.")
 
     def start(self):

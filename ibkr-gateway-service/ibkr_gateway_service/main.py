@@ -13,6 +13,23 @@ from .response_processor import ResponseProcessor
 from .kafka_producer import BrokerEventProducer
 from .order_id_mapper import OrderIdMapper
 from .leader_election import LeaderElector # New import
+from .utils.secrets import get_secret # For Redis password
+
+# Attempt to import redis, but don't fail if not installed unless Redis is configured
+try:
+    import redis # type: ignore
+except ImportError:
+    redis = None # type: ignore
+
+# Kafka client and JSON for message processing
+try:
+    from confluent_kafka import Consumer, KafkaError, KafkaException # type: ignore
+except ImportError:
+    Consumer = None # type: ignore
+    KafkaError = None # type: ignore
+    KafkaException = None # type: ignore
+import json
+
 
 # Setup basic logging
 logging.basicConfig(
@@ -33,6 +50,138 @@ _app_stop_event = threading.Event()
 def _signal_handler(signum, frame):
     logger.info(f"OS Signal {signal.Signals(signum).name} received, initiating graceful shutdown...")
     _app_stop_event.set()
+
+# Kafka Consumer Loop for OMS Order Requests
+def oms_request_consumer_loop(cfg: Config, request_h: RequestHandler, stop_event: threading.Event, leader_event: threading.Event):
+    if not Consumer:
+        logger.error("OMS Consumer: confluent_kafka library not installed. Cannot start consumer loop.")
+        return
+
+    consumer_config = {
+        'bootstrap.servers': cfg.kafka.bootstrap_servers,
+        'group.id': cfg.kafka.consumer_group_id_oms_requests or "ibkr-gateway-oms-requests-consumer-group", # Ensure consumer_group_id_oms_requests is in KafkaConfig
+        'auto.offset.reset': 'latest', # Or 'earliest', make configurable if needed
+        'enable.auto.commit': True # Or False for manual commits
+        # Add other consumer configs as needed, e.g., security.protocol for SASL
+    }
+    logger.info(f"OMS Consumer: Initializing with config: {consumer_config}")
+    consumer = Consumer(consumer_config)
+    consumer.subscribe([cfg.kafka.oms_order_requests_topic])
+    logger.info(f"OMS Consumer: Subscribed to topic '{cfg.kafka.oms_order_requests_topic}'")
+
+    consecutive_message_processing_errors = 0
+    MESSAGE_PROCESSING_ERROR_THRESHOLD = 5
+
+    try:
+        while not stop_event.is_set():
+            if not leader_event.is_set(): # Only consume if leader
+                stop_event.wait(timeout=1.0)
+                continue
+
+            msg = consumer.poll(timeout=1.0)
+
+            if msg is None:
+                consecutive_message_processing_errors = 0 # Reset if poll is successful, even if no message
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    logger.debug(f"OMS Consumer: Reached end of partition for {msg.topic()} [{msg.partition()}] at offset {msg.offset()}")
+                    consecutive_message_processing_errors = 0 # Reset on normal EOF
+                elif msg.error().fatal():
+                    logger.fatal(f"CRITICAL_ALERT: OMSOrderConsumer: Kafka consumer fatal error: {msg.error()}. OMS_CONSUMER_FATAL_ERROR")
+                    break # Exit loop on fatal Kafka error
+                else:
+                    logger.error(f"OMS Consumer: Kafka error: {msg.error()}")
+                    # Non-fatal Kafka errors might not increment message processing error counter unless they persist
+                continue
+
+            raw_msg_value = msg.value().decode('utf-8') if msg.value() else None
+            logger.info(f"OMS Consumer: Received message from topic '{msg.topic()}': key='{msg.key()}', value='{raw_msg_value}'")
+
+            if not raw_msg_value:
+                logger.warning("OMS Consumer: Received empty message value. Skipping.")
+                consecutive_message_processing_errors = 0 # Reset for this specific message skip
+                continue
+
+            current_msg_processed_successfully = False
+            try:
+                order_request_data = json.loads(raw_msg_value)
+                action_type = order_request_data.get("action_type")
+                payload = order_request_data.get("payload")
+
+                if not action_type or not payload or not isinstance(payload, dict):
+                    logger.error(f"OMS Consumer: Invalid message structure. 'action_type' or 'payload' missing or invalid. Message: {order_request_data}")
+                    # This is a message format error, counts towards processing errors
+                    raise ValueError("Invalid message structure")
+
+                logger.info(f"OMS Consumer: Processing action '{action_type}' with payload: {payload}")
+                if action_type == "NEW_ORDER":
+                    result = request_h.process_internal_order_request(internal_order_req=payload)
+                    logger.info(f"OMS Consumer: NEW_ORDER processing result: {result}")
+                elif action_type == "CANCEL_ORDER":
+                    ib_order_id_to_cancel = payload.get("ib_order_id_to_cancel")
+                    platform_order_id_to_cancel = payload.get("platform_order_id_to_cancel")
+                    if ib_order_id_to_cancel is not None:
+                        request_h.process_order_cancellation_request(ib_order_id_to_cancel=int(ib_order_id_to_cancel))
+                    elif platform_order_id_to_cancel is not None:
+                         request_h.process_order_cancellation_request(platform_order_id_to_cancel=platform_order_id_to_cancel)
+                    else:
+                        logger.error("OMS Consumer: CANCEL_ORDER requires 'ib_order_id_to_cancel' or 'platform_order_id_to_cancel' in payload.")
+                        raise ValueError("Missing order ID for cancel operation")
+                elif action_type == "MODIFY_ORDER":
+                    ib_order_id_to_modify = payload.get("ib_order_id_to_modify")
+                    platform_order_id_to_modify = payload.get("platform_order_id_to_modify")
+                    modifications = payload.get("modifications")
+                    if not modifications or not isinstance(modifications, dict):
+                        logger.error("OMS Consumer: MODIFY_ORDER 'modifications' payload is missing or invalid.")
+                        raise ValueError("Invalid modifications payload for modify operation")
+
+                    if ib_order_id_to_modify is not None:
+                        request_h.process_order_modification_request(order_mod_req=modifications, ib_order_id_to_modify=int(ib_order_id_to_modify))
+                    elif platform_order_id_to_modify is not None:
+                        request_h.process_order_modification_request(order_mod_req=modifications, platform_order_id_to_modify=platform_order_id_to_modify)
+                    else:
+                        logger.error("OMS Consumer: MODIFY_ORDER requires 'ib_order_id_to_modify' or 'platform_order_id_to_modify' in payload.")
+                        raise ValueError("Missing order ID for modify operation")
+                else:
+                    logger.warning(f"OMS Consumer: Unknown action_type '{action_type}'. Skipping message.")
+                    # Consider if unknown action type should be an error or just a skip
+
+                current_msg_processed_successfully = True # Mark as success if no exception from handler
+
+            except json.JSONDecodeError as e_json:
+                logger.error(f"OMS Consumer: Failed to deserialize JSON message: {e_json}. Message: {raw_msg_value}")
+                # This is a message format error, counts towards processing errors
+            except ValueError as e_val: # Catch custom ValueErrors from logic above
+                logger.error(f"OMS Consumer: Validation error processing message: {e_val}. Message: {order_request_data if 'order_request_data' in locals() else raw_msg_value}")
+            except Exception as e_proc: # Catch errors from RequestHandler calls
+                logger.error(f"OMS Consumer: Error processing action '{action_type if 'action_type' in locals() else 'unknown'}': {e_proc}", exc_info=True)
+
+            if current_msg_processed_successfully:
+                consecutive_message_processing_errors = 0 # Reset on any successfully processed message (or skipped unknown action)
+            else: # An error occurred during this message's processing
+                consecutive_message_processing_errors += 1
+                if consecutive_message_processing_errors > MESSAGE_PROCESSING_ERROR_THRESHOLD:
+                    last_error_for_alert = "N/A"
+                    if 'e_json' in locals(): last_error_for_alert = str(e_json)
+                    elif 'e_val' in locals(): last_error_for_alert = str(e_val)
+                    elif 'e_proc' in locals(): last_error_for_alert = str(e_proc)
+                    logger.critical(
+                        f"CRITICAL_ALERT: OMSOrderConsumer: Too many consecutive message processing failures ({consecutive_message_processing_errors}). "
+                        f"Last error context: {last_error_for_alert}. OMS_CONSUMER_MESSAGE_PROCESSING_FAILURE"
+                    )
+                    # Potentially reset counter after alert to avoid spam, or implement cooldown
+                    # consecutive_message_processing_errors = 0
+
+    except KafkaException as e_kafka_fatal: # For fatal errors from consumer not caught by msg.error().is_fatal()
+        logger.fatal(f"CRITICAL_ALERT: OMSOrderConsumer: Kafka consumer loop fatal KafkaException: {e_kafka_fatal}. OMS_CONSUMER_FATAL_KAFKA_EXCEPTION", exc_info=True)
+    except Exception as e:
+        logger.error(f"OMS Consumer: Unexpected error in consumer loop: {e}", exc_info=True)
+    finally:
+        logger.info("OMS Consumer: Closing Kafka consumer.")
+        consumer.close()
+        logger.info("OMS Consumer: Kafka consumer closed.")
+
 
 def main():
     # Register signal handlers for SIGINT (Ctrl+C) and SIGTERM
@@ -73,10 +222,39 @@ def main():
         config=cfg.ibkr
     )
 
+    # --- Initialize Redis Client (if configured) ---
+    redis_client = None
+    if cfg.redis and cfg.redis.host: # Check if RedisConfig exists and host is configured
+        if not redis:
+            logger.error("Redis is configured (host specified) but 'redis' library is not installed. OrderIdMapper will use in-memory storage.")
+        else:
+            redis_password = None
+            if cfg.redis.password_secret_name:
+                try:
+                    redis_password = get_secret(cfg.redis.password_secret_name, cfg.aws_region)
+                    logger.info("Successfully fetched Redis password from Secrets Manager.")
+                except Exception as e:
+                    logger.error(f"Failed to load Redis password from secret '{cfg.redis.password_secret_name}': {e}. Attempting to connect without password.")
+
+            try:
+                redis_client = redis.Redis(
+                    host=cfg.redis.host,
+                    port=cfg.redis.port,
+                    db=cfg.redis.db,
+                    password=redis_password,
+                    decode_responses=True # Ensures strings are returned, not bytes
+                )
+                redis_client.ping()
+                logger.info(f"Successfully connected to Redis at {cfg.redis.host}:{cfg.redis.port}/{cfg.redis.db}")
+            except Exception as e:
+                logger.error(f"Failed to connect to Redis: {e}. OrderIdMapper will use in-memory storage.")
+                redis_client = None # Ensure it's None if connection failed
+    else:
+        logger.info("Redis host not configured in settings. OrderIdMapper will use in-memory storage.")
+
     # 5. Initialize RequestHandler
-    order_id_mpr = OrderIdMapper()
-    # TODO: For production OrderIdMapper, initialize with a persistent store client (e.g., Redis client)
-    # order_id_mpr = OrderIdMapper(redis_client=get_redis_client_from_config(cfg.redis))
+    order_id_mpr = OrderIdMapper(redis_client=redis_client)
+    # OrderIdMapper's __init__ will log whether it's using Redis or in-memory.
 
     request_h = RequestHandler(
         ib_client_wrapper=ib_client_w,
@@ -101,26 +279,49 @@ def main():
 
     # --- Leader Election Callbacks ---
     is_leader_event = threading.Event() # Event to signal leadership status to main loop
+    oms_consumer_thread: Optional[threading.Thread] = None
+    oms_consumer_stop_event = threading.Event()
+
 
     def on_started_leading_func():
+        nonlocal oms_consumer_thread # To assign to the oms_consumer_thread in the outer scope
         logger.info(f"Instance {cfg.service_instance_id} became the LEADER.")
         is_leader_event.set()
+
         # Start core services that only the leader should run
         logger.info("Leader: Starting IBKR Connection Manager for trading...")
-        conn_manager.start() # Start connection attempts with primary/trading client ID
+        conn_manager.start()
         logger.info("Leader: Starting Response Processor...")
         response_proc.start()
-        # TODO: Leader might also start Kafka consumers for OMS orders if that's its role
+
+        logger.info("Leader: Starting OMS Order Request Consumer...")
+        oms_consumer_stop_event.clear() # Clear stop event before starting thread
+        oms_consumer_thread = threading.Thread(
+            target=oms_request_consumer_loop,
+            args=(cfg, request_h, oms_consumer_stop_event, is_leader_event), # Pass request_h and leader_event
+            name="OMSRequestConsumerLoop",
+            daemon=True
+        )
+        oms_consumer_thread.start()
 
     def on_stopped_leading_func():
+        nonlocal oms_consumer_thread # To access the oms_consumer_thread from the outer scope
         logger.info(f"Instance {cfg.service_instance_id} lost leadership or is stopping as leader.")
         is_leader_event.clear()
-        # Stop core services or transition them to standby
+
+        logger.info("Not Leader: Stopping OMS Order Request Consumer...")
+        if oms_consumer_thread and oms_consumer_thread.is_alive():
+            oms_consumer_stop_event.set()
+            oms_consumer_thread.join(timeout=5) # Wait for graceful shutdown
+            if oms_consumer_thread.is_alive():
+                logger.warning("OMS Consumer thread did not stop in time.")
+        oms_consumer_thread = None # Clear the thread variable
+
+        # Stop other core services
         logger.info("Not Leader: Stopping Response Processor...")
         response_proc.stop()
         logger.info("Not Leader: Stopping IBKR Connection Manager...")
         conn_manager.stop()
-        # TODO: Leader might also stop Kafka consumers for OMS orders
 
     # 8. Initialize LeaderElector
     # POD_NAME should be passed as identity for K8s environments via Downward API
@@ -171,6 +372,15 @@ def main():
         # on_stopped_leading should have already called response_proc.stop() and conn_manager.stop()
         # if this instance was the leader. If it wasn't, they weren't started by leader callbacks.
         # However, ensure they are gracefully stopped if they were somehow running.
+
+        # Stop OMS Consumer Thread (if active and not stopped by on_stopped_leading_func)
+        if oms_consumer_thread and oms_consumer_thread.is_alive():
+            logger.info("Ensuring OMS Order Request Consumer is stopped...")
+            oms_consumer_stop_event.set()
+            oms_consumer_thread.join(timeout=5)
+            if oms_consumer_thread.is_alive():
+                logger.warning("OMS Consumer thread did not stop in time during final shutdown.")
+
         if response_proc._thread and response_proc._thread.is_alive(): # Check if processor was started
             logger.info("Ensuring Response Processor is stopped...")
             response_proc.stop()
